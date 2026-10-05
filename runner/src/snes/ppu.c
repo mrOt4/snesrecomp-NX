@@ -231,6 +231,181 @@ void PpuSetWidescreenLineEnhancer(Ppu *ppu,
   ppu->widescreenLineEnhancerContext = enhancer ? context : NULL;
 }
 
+void PpuSetIdentityCapture(Ppu *ppu, PpuIdentityPixel *pixels, size_t pitch,
+                           PpuIdentityLine *lines) {
+  const bool on = pixels && lines && pitch;
+  ppu->identPixels = on ? pixels : NULL;
+  ppu->identLines = on ? lines : NULL;
+  ppu->identPitch = on ? (uint32_t)pitch : 0;
+}
+
+static FORCEINLINE bool PpuIdentOn(const Ppu *ppu) {
+  return ppu->identPixels != NULL;
+}
+
+/* Record identity for one drawn tile segment. A position belongs to this
+ * tile exactly when its priority byte matches the tile's z: each (layer,
+ * priority) pair owns a unique z level and a layer covers each column of a
+ * buffer once per line. `s0` is the first screen-order source column. */
+static FORCEINLINE bool PpuIdentLive(const Ppu *ppu, const PpuIdentity *e) {
+  return e->gen == ppu->identGen;
+}
+
+/* Replace *dst with *candidate when the candidate is live and higher. */
+static FORCEINLINE void PpuIdentKeepHigher(const Ppu *ppu, PpuIdentity *dst,
+                                           const PpuIdentity *candidate) {
+  if (PpuIdentLive(ppu, candidate) &&
+      (!PpuIdentLive(ppu, dst) || candidate->z > dst->z))
+    *dst = *candidate;
+}
+
+static FORCEINLINE PpuIdentity PpuIdentBackdrop(const Ppu *ppu) {
+  PpuIdentity e = {0};
+  e.gen = ppu->identGen;
+  return e;
+}
+
+static void PpuIdentClear(PpuPixelPrioBufs *buf) {
+  memset(buf->ident, 0, sizeof buf->ident);
+  memset(buf->under, 0, sizeof buf->under);
+  memset(buf->cover, 0, sizeof buf->cover);
+}
+
+/* The new top pixel of buf at i: its predecessor becomes the under pixel. */
+static FORCEINLINE void PpuIdentPushTop(Ppu *ppu, PpuPixelPrioBufs *buf,
+                                        size_t i, const PpuIdentity *top) {
+  PpuIdentity under = PpuIdentLive(ppu, &buf->under[i])
+                          ? buf->under[i] : PpuIdentBackdrop(ppu);
+  PpuIdentKeepHigher(ppu, &under, &buf->ident[i]);
+  buf->under[i] = under;
+  buf->ident[i] = *top;
+}
+
+static unsigned PpuIdentTexel(const Ppu *ppu, unsigned row_addr,
+                              unsigned depth, unsigned col) {
+  const unsigned bit = 7 - col;
+  const uint16 p01 = ppu->vram[row_addr & 0x7fff];
+  unsigned value = ((p01 >> bit) & 1) | (((p01 >> (bit + 8)) & 1) << 1);
+  if (depth != kPpuIdentDepth_2bpp) {
+    const uint16 p23 = ppu->vram[(row_addr + 8) & 0x7fff];
+    value |= (((p23 >> bit) & 1) << 2) | (((p23 >> (bit + 8)) & 1) << 3);
+  }
+  return value;
+}
+
+static void PpuIdentSpan(Ppu *ppu, PpuPixelPrioBufs *buf,
+                         const PpuZbufType *seg, int count, int s0,
+                         uint32 tile, unsigned row_addr, unsigned depth,
+                         PpuZbufType z) {
+  const size_t base = (size_t)(seg - buf->data);
+  const bool hflip = (tile & 0x4000) != 0;
+  const uint8_t meta_flags = (uint8_t)((hflip ? kPpuIdentMeta_HFlip : 0) |
+      ((tile & 0x8000) ? kPpuIdentMeta_VFlip : 0) |
+      (depth << kPpuIdentMeta_DepthShift));
+  for (int j = 0; j < count; j++) {
+    const int s = s0 + j;
+    const unsigned col = hflip ? 7 - s : s;
+    const unsigned texel = PpuIdentTexel(ppu, row_addr, depth, col);
+    const PpuZbufType v = seg[j];
+    PpuIdentity e;
+    e.gen = ppu->identGen;
+    e.addr = (uint16_t)(row_addr & 0x7fff);
+    e.meta = (uint8_t)(col | meta_flags);
+    e.pad = 0;
+    if (texel && (v >> 8) == (z >> 8) && (v & 0xff)) {
+      e.z = v;  /* this tile won the pixel */
+      PpuIdentPushTop(ppu, buf, base + j, &e);
+    } else if (texel) {
+      e.z = (PpuZbufType)(z + texel);  /* opaque but below the top pixel */
+      if ((e.z >> 8) < (v >> 8))
+        PpuIdentKeepHigher(ppu, &buf->under[base + j], &e);
+    } else if ((z >> 8) > (v >> 8)) {
+      e.z = z;  /* transparent here, above the top pixel */
+      PpuIdentKeepHigher(ppu, &buf->cover[base + j], &e);
+    }
+  }
+}
+
+/* Merge src[si] into dst[di] keeping the top two opaque pixels and the
+ * highest cover; `src_wins` is the caller's priority decision for data[]. */
+static void PpuIdentMerge(Ppu *ppu, PpuPixelPrioBufs *dst, size_t di,
+                          const PpuPixelPrioBufs *src, size_t si,
+                          bool src_wins) {
+  if (src_wins) {
+    PpuIdentity under = PpuIdentLive(ppu, &dst->under[di])
+                            ? dst->under[di] : PpuIdentBackdrop(ppu);
+    PpuIdentKeepHigher(ppu, &under, &dst->ident[di]);
+    PpuIdentKeepHigher(ppu, &under, &src->under[si]);
+    dst->under[di] = under;
+    dst->ident[di] = src->ident[si];
+  } else {
+    PpuIdentKeepHigher(ppu, &dst->under[di], &src->ident[si]);
+  }
+  PpuIdentKeepHigher(ppu, &dst->cover[di], &src->cover[si]);
+}
+
+static FORCEINLINE void PpuIdentCopy(Ppu *ppu, PpuPixelPrioBufs *dst,
+                                     size_t di, const PpuPixelPrioBufs *src,
+                                     size_t si) {
+  (void)ppu;
+  dst->ident[di] = src->ident[si];
+  dst->under[di] = src->under[si];
+  dst->cover[di] = src->cover[si];
+}
+
+static FORCEINLINE uint32_t PpuIdentEntryRef(const PpuIdentity *e) {
+  return (uint32_t)e->addr |
+      (uint32_t)(e->meta & kPpuIdentMeta_ColMask) << kPpuIdentRef_ColShift |
+      ((e->meta & kPpuIdentMeta_HFlip) ? kPpuIdentRef_HFlip : 0) |
+      ((e->meta & kPpuIdentMeta_VFlip) ? kPpuIdentRef_VFlip : 0) |
+      (uint32_t)(e->meta >> kPpuIdentMeta_DepthShift) << kPpuIdentRef_DepthShift |
+      kPpuIdentRef_Valid;
+}
+
+static FORCEINLINE uint32_t PpuIdentRef(const Ppu *ppu,
+                                        const PpuPixelPrioBufs *buf,
+                                        size_t i) {
+  const PpuIdentity *e = &buf->ident[i];
+  if (e->gen != ppu->identGen || e->z != buf->data[i] || !(e->z & 0xff))
+    return 0;
+  return PpuIdentEntryRef(e);
+}
+
+static FORCEINLINE bool PpuLayerIsObj(unsigned layer) {
+  return layer == 4 || layer == 6;
+}
+
+/* Under and cover of the main-screen top pixel (see PpuIdentityPixel). */
+static void PpuIdentEmitShape(const Ppu *ppu, PpuIdentityPixel *gp,
+                              const PpuPixelPrioBufs *buf, size_t i) {
+  const PpuZbufType top = buf->data[i];
+  const PpuIdentity *under = &buf->under[i];
+  const PpuIdentity *cover = &buf->cover[i];
+  gp->under_ref = 0;
+  gp->cover_ref = 0;
+  gp->under_index = 0;
+  gp->cover_base = 0;
+  gp->under_layer = 0;
+  gp->cover_layer = 0;
+  if (gp->main_ref && under->gen == ppu->identGen && (under->z >> 8) < (top >> 8)) {
+    gp->under_index = (uint8_t)(under->z & 0xff);
+    gp->under_layer = (uint8_t)((under->z >> 8) & 0xf);
+    /* Backdrop markers carry no texel, only "nothing opaque below". */
+    gp->under_ref = gp->under_index ? PpuIdentEntryRef(under)
+                                    : kPpuIdentRef_Valid;
+  }
+  if (cover->gen == ppu->identGen) {
+    const unsigned cover_layer = (cover->z >> 8) & 0xf;
+    const bool above = (cover->z >> 8) > (top >> 8) ||
+        ((cover->z >> 8) == (top >> 8) && PpuLayerIsObj(cover_layer));
+    if (above) {
+      gp->cover_ref = PpuIdentEntryRef(cover);
+      gp->cover_base = (uint8_t)(cover->z & 0xff);
+      gp->cover_layer = (uint8_t)cover_layer;
+    }
+  }
+}
+
 void PpuClearOverlayCaptures(Ppu *ppu) {
   memset(ppu->overlayCaptures, 0, sizeof(ppu->overlayCaptures));
 }
@@ -612,6 +787,9 @@ void ppu_runLine(Ppu* ppu, int line) {
       memset(&ppu->brightnessMult[32], ppu->brightnessMult[31], 31);
     }
 
+    // A fresh identity generation per line invalidates every older entry.
+    if (ppu->identPixels && ++ppu->identGen == 0)
+      ppu->identGen = 1;
     // evaluate sprites
     ClearBackdrop(&ppu->objBuffer);
     if (ppu->overlayRenderBuffer[kPpuOverlaySource_Obj])
@@ -845,7 +1023,8 @@ static FORCEINLINE bool PpuViewportAllows(Ppu *ppu, uint layer, int screen_x,
 /* Select cartridge pixels inside the authentic viewport and shadow pixels
  * outside it, including palette, priority, flips, and transparency. Adapted
  * from DKC2Recomp engine 3a929cd; DKC1 retains its diagnostic lookup API. */
-static void PpuDrawMixed4bppTile(Ppu *ppu, PpuZbufType *dstz, uint layer,
+static void PpuDrawMixed4bppTile(Ppu *ppu, PpuPixelPrioBufs *identbuf,
+                                 PpuZbufType *dstz, uint layer,
                                  int source_bias, int screen_x,
                                  int source_offset, int count,
                                  uint16 real_tile, uint16 shadow_tile,
@@ -880,8 +1059,19 @@ static void PpuDrawMixed4bppTile(Ppu *ppu, PpuZbufType *dstz, uint layer,
       continue;
     PpuZbufType z = (tile & 0x2000u) ? zhi : zlo;
     z += (tile & 0x1c00u) >> 6;
-    if (z > dstz[j])
+    if (z > dstz[j]) {
       dstz[j] = z + pixel;
+      if (identbuf) {
+        PpuIdentity *e = &identbuf->ident[dstz + j - identbuf->data];
+        e->z = dstz[j];
+        e->gen = ppu->identGen;
+        e->addr = (uint16_t)((addr - ppu->vram) & 0x7fff);
+        e->meta = (uint8_t)(((tile & 0x4000u) ? 7 - i : i) |
+            ((tile & 0x4000u) ? kPpuIdentMeta_HFlip : 0) |
+            ((tile & 0x8000u) ? kPpuIdentMeta_VFlip : 0) |
+            (kPpuIdentDepth_4bpp << kPpuIdentMeta_DepthShift));
+      }
+    }
   }
 }
 
@@ -905,6 +1095,7 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
   enum { kPaletteShift = 6 };
   if (!IS_SCREEN_ENABLED(ppu, sub, layer))
     return;  // layer is completely hidden
+  const bool ident_on = PpuIdentOn(ppu);
   PpuWindows win;
   IS_SCREEN_WINDOWED(ppu, sub, layer) ? PpuWindows_Calc(&win, ppu, layer, y) : PpuWindows_Clear(&win, ppu, layer, y);
   int16 ws_bias[8] = { 0 };
@@ -963,7 +1154,7 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
             segment_x + curw > native_right));
       if (mixed_tile) {
         PpuDrawMixed4bppTile(
-            ppu, dstz, layer, ws_bias[windex], segment_x,
+            ppu, ident_on ? dstbuf : NULL, dstz, layer, ws_bias[windex], segment_x,
             source_offset, curw, real_tile, (uint16)tile,
             tileadr0, tileadr1, zhi, zlo);
         x += curw;
@@ -973,6 +1164,8 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
         PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
         uint32 bits = READ_BITS(ta, tile & 0x3ff);
         if (bits) {
+          PpuZbufType *const seg = dstz;
+          const int seg_n = curw;
           z += ((tile & 0x1c00) >> kPaletteShift);
           if (tile & 0x4000) {
             bits >>= (x & 7), x += curw;
@@ -981,6 +1174,9 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
             bits <<= (x & 7), x += curw;
             do DO_PIXEL_HFLIP(0); while (bits <<= 1, dstz++, --curw);
           }
+          if (ident_on)
+            PpuIdentSpan(ppu, dstbuf, seg, seg_n, source_offset, tile,
+                         (unsigned)(addr - ppu->vram), kPpuIdentDepth_4bpp, z);
         } else {
           dstz += curw;
         }
@@ -997,7 +1193,7 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
            (segment_x < native_right &&
             segment_x + 8 > native_right))) {
         PpuDrawMixed4bppTile(
-            ppu, dstz, layer, ws_bias[windex], segment_x,
+            ppu, ident_on ? dstbuf : NULL, dstz, layer, ws_bias[windex], segment_x,
             0, 8, real_tile, (uint16)tile,
             tileadr0, tileadr1, zhi, zlo);
         dstz += 8, w -= 8, ws_sx += 8;
@@ -1015,6 +1211,9 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
           DO_PIXEL_HFLIP(0); DO_PIXEL_HFLIP(1); DO_PIXEL_HFLIP(2); DO_PIXEL_HFLIP(3);
           DO_PIXEL_HFLIP(4); DO_PIXEL_HFLIP(5); DO_PIXEL_HFLIP(6); DO_PIXEL_HFLIP(7);
         }
+        if (ident_on)
+          PpuIdentSpan(ppu, dstbuf, dstz, 8, 0, tile,
+                       (unsigned)(addr - ppu->vram), kPpuIdentDepth_4bpp, z);
       }
       dstz += 8, w -= 8, ws_sx += 8;
     }
@@ -1028,7 +1227,7 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
            (segment_x < native_right &&
             segment_x + (int)w > native_right))) {
         PpuDrawMixed4bppTile(
-            ppu, dstz, layer, ws_bias[windex], segment_x,
+            ppu, ident_on ? dstbuf : NULL, dstz, layer, ws_bias[windex], segment_x,
             0, (int)w, real_tile, (uint16)tile,
             tileadr0, tileadr1, zhi, zlo);
         continue;
@@ -1037,12 +1236,17 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
       PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
       uint32 bits = READ_BITS(ta, tile & 0x3ff);
       if (bits) {
+        PpuZbufType *const seg = dstz;
+        const int seg_n = (int)w;
         z += ((tile & 0x1c00) >> kPaletteShift);
         if (tile & 0x4000) {
           do DO_PIXEL(0); while (bits >>= 1, dstz++, --w);
         } else {
           do DO_PIXEL_HFLIP(0); while (bits <<= 1, dstz++, --w);
         }
+        if (ident_on)
+          PpuIdentSpan(ppu, dstbuf, seg, seg_n, 0, tile,
+                       (unsigned)(addr - ppu->vram), kPpuIdentDepth_4bpp, z);
       }
     }
   }
@@ -1412,6 +1616,7 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, PpuPixelPrioBufs *dstbuf, uint y, b
   enum { kPaletteShift = 8 };
   if (!IS_SCREEN_ENABLED(ppu, sub, layer))
     return;  // layer is completely hidden
+  const bool ident_on = PpuIdentOn(ppu);
   PpuWindows win;
   IS_SCREEN_WINDOWED(ppu, sub, layer) ? PpuWindows_Calc(&win, ppu, layer, y) : PpuWindows_Clear(&win, ppu, layer, y);
   // Widescreen HUD split (PpuSetWidescreenHudSplit): on HUD scanlines,
@@ -1477,6 +1682,8 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, PpuPixelPrioBufs *dstbuf, uint y, b
       PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
       uint32 bits = READ_BITS(ta, tile & 0x3ff);
       if (bits) {
+        PpuZbufType *const seg = dstz;
+        const int seg_n = curw, seg_s0 = (int)(x & 7);
         z += ((tile & 0x1c00) >> kPaletteShift);
         if (tile & 0x4000) {
           bits >>= (x & 7), x += curw;
@@ -1485,6 +1692,9 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, PpuPixelPrioBufs *dstbuf, uint y, b
           bits <<= (x & 7), x += curw;
           do DO_PIXEL_HFLIP(0); while (bits <<= 1, dstz++, --curw);
         }
+        if (ident_on)
+          PpuIdentSpan(ppu, dstbuf, seg, seg_n, seg_s0, tile,
+                       (unsigned)(addr - ppu->vram), kPpuIdentDepth_2bpp, z);
       } else {
         dstz += curw;
       }
@@ -1505,6 +1715,9 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, PpuPixelPrioBufs *dstbuf, uint y, b
           DO_PIXEL_HFLIP(0); DO_PIXEL_HFLIP(1); DO_PIXEL_HFLIP(2); DO_PIXEL_HFLIP(3);
           DO_PIXEL_HFLIP(4); DO_PIXEL_HFLIP(5); DO_PIXEL_HFLIP(6); DO_PIXEL_HFLIP(7);
         }
+        if (ident_on)
+          PpuIdentSpan(ppu, dstbuf, dstz, 8, 0, tile,
+                       (unsigned)(addr - ppu->vram), kPpuIdentDepth_2bpp, z);
       }
       dstz += 8, w -= 8;
     }
@@ -1515,12 +1728,17 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, PpuPixelPrioBufs *dstbuf, uint y, b
       PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
       uint32 bits = READ_BITS(ta, tile & 0x3ff);
       if (bits) {
+        PpuZbufType *const seg = dstz;
+        const int seg_n = (int)w;
         z += ((tile & 0x1c00) >> kPaletteShift);
         if (tile & 0x4000) {
           do DO_PIXEL(0); while (bits >>= 1, dstz++, --w);
         } else {
           do DO_PIXEL_HFLIP(0); while (bits <<= 1, dstz++, --w);
         }
+        if (ident_on)
+          PpuIdentSpan(ppu, dstbuf, seg, seg_n, 0, tile,
+                       (unsigned)(addr - ppu->vram), kPpuIdentDepth_2bpp, z);
       }
     }
   }
@@ -1613,23 +1831,32 @@ static void PpuMergePaddedBackground(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
   const PpuZbufType *src = layerbuf->data;
   int left_extra = full_budget ? ppu->extraLeftRight : ppu->extraLeftCur;
   int right_extra = full_budget ? ppu->extraLeftRight : ppu->extraRightCur;
+  const bool ident_on = PpuIdentOn(ppu);
+#define MERGE(di, si) \
+  if (src[si] > dst[di]) { \
+    dst[di] = src[si]; \
+    if (ident_on) PpuIdentMerge(ppu, dstbuf, (di), layerbuf, (si), true); \
+  } else if (ident_on) { \
+    PpuIdentMerge(ppu, dstbuf, (di), layerbuf, (si), false); \
+  }
   for (int x = 0; x < kPpuXPixels; x++) {
     int i = x + kPpuExtraLeftRight;
-    if (src[i] > dst[i]) dst[i] = src[i];
+    MERGE(i, i)
   }
   for (int x = -left_extra; x < 0; x++) {
     int di = x + kPpuExtraLeftRight;
     int sx = repeat ? kPpuXPixels + x : -x;
     int si = sx + kPpuExtraLeftRight;
-    if (src[si] > dst[di]) dst[di] = src[si];
+    MERGE(di, si)
   }
   for (int x = kPpuXPixels;
        x < kPpuXPixels + right_extra; x++) {
     int di = x + kPpuExtraLeftRight;
     int sx = repeat ? x - kPpuXPixels : kPpuXPixels * 2 - 2 - x;
     int si = sx + kPpuExtraLeftRight;
-    if (src[si] > dst[di]) dst[di] = src[si];
+    MERGE(di, si)
   }
+#undef MERGE
 }
 
 static void PpuMergeStretchedBackground(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
@@ -1648,7 +1875,12 @@ static void PpuMergeStretchedBackground(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
     if (sx < 0) sx = 0;
     if (sx >= kPpuXPixels) sx = kPpuXPixels - 1;
     int si = sx + kPpuExtraLeftRight;
-    if (src[si] > dst[di]) dst[di] = src[si];
+    if (src[si] > dst[di]) {
+      dst[di] = src[si];
+      if (PpuIdentOn(ppu)) PpuIdentMerge(ppu, dstbuf, di, layerbuf, si, true);
+    } else if (PpuIdentOn(ppu)) {
+      PpuIdentMerge(ppu, dstbuf, di, layerbuf, si, false);
+    }
   }
 }
 
@@ -1671,19 +1903,33 @@ static void PpuMergeAxisMirroredBackground(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
   // outward from that line but rewrites margin columns only.
   const int left_end = IntMin(left_axis, 0);
   const int right_start = IntMax(right_axis, kPpuXPixels);
+  const bool ident_on = PpuIdentOn(ppu);
   for (int x = lo; x < left_end && x < hi; x++) {
     const int sx = 2 * left_axis - 1 - x;
-    if (sx >= lo && sx < hi)
+    if (sx >= lo && sx < hi) {
       src[x + kPpuExtraLeftRight] = src[sx + kPpuExtraLeftRight];
+      if (ident_on)
+        PpuIdentCopy(ppu, layerbuf, x + kPpuExtraLeftRight, layerbuf,
+                     sx + kPpuExtraLeftRight);
+    }
   }
   for (int x = IntMax(right_start, lo); x < hi; x++) {
     const int sx = 2 * right_axis - 1 - x;
-    if (sx >= lo && sx < hi)
+    if (sx >= lo && sx < hi) {
       src[x + kPpuExtraLeftRight] = src[sx + kPpuExtraLeftRight];
+      if (ident_on)
+        PpuIdentCopy(ppu, layerbuf, x + kPpuExtraLeftRight, layerbuf,
+                     sx + kPpuExtraLeftRight);
+    }
   }
   for (int x = lo; x < hi; x++) {
     const int i = x + kPpuExtraLeftRight;
-    if (src[i] > dst[i]) dst[i] = src[i];
+    if (src[i] > dst[i]) {
+      dst[i] = src[i];
+      if (ident_on) PpuIdentMerge(ppu, dstbuf, i, layerbuf, i, true);
+    } else if (ident_on) {
+      PpuIdentMerge(ppu, dstbuf, i, layerbuf, i, false);
+    }
   }
 }
 
@@ -1712,6 +1958,8 @@ static void PpuDrawBackground_4bpp_policy(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
 
   PpuPixelPrioBufs layerbuf;
   ClearBackdrop(&layerbuf);
+  if (PpuIdentOn(ppu))
+    PpuIdentClear(&layerbuf);
   if (PPU_bigTiles(ppu, layer))
     PpuDrawBackgroundBig(ppu, &layerbuf, y, sub, layer, 4, zhi, zlo, mosaic);
   else if (mosaic)
@@ -1757,6 +2005,8 @@ static void PpuDrawBackground_2bpp_policy(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
 
   PpuPixelPrioBufs layerbuf;
   ClearBackdrop(&layerbuf);
+  if (PpuIdentOn(ppu))
+    PpuIdentClear(&layerbuf);
   if (PPU_bigTiles(ppu, layer))
     PpuDrawBackgroundBig(ppu, &layerbuf, y, sub, layer, 2, zhi, zlo, mosaic);
   else if (mosaic)
@@ -1930,7 +2180,21 @@ static void PpuDrawSprites(Ppu *ppu, uint y, uint sub, bool clear_backdrop) {
     int width = win.edges[windex + 1] - left;
     PpuZbufType *src = ppu->objBuffer.data + left + kPpuExtraLeftRight;
     PpuZbufType *dst = ppu->bgBuffers[sub].data + left + kPpuExtraLeftRight;
-    if (clear_backdrop) {
+    if (PpuIdentOn(ppu)) {
+      const size_t i0 = (size_t)(left + kPpuExtraLeftRight);
+      for (int k = 0; k < width; k++) {
+        if (clear_backdrop) {
+          dst[k] = src[k];
+          PpuIdentCopy(ppu, &ppu->bgBuffers[sub], i0 + k, &ppu->objBuffer,
+                       i0 + k);
+        } else {
+          const bool wins = src[k] > dst[k];
+          if (wins) dst[k] = src[k];
+          PpuIdentMerge(ppu, &ppu->bgBuffers[sub], i0 + k, &ppu->objBuffer,
+                        i0 + k, wins);
+        }
+      }
+    } else if (clear_backdrop) {
       memcpy(dst, src, width * sizeof(uint16));
     } else {
       do {
@@ -2038,8 +2302,15 @@ static void PpuFinishBackgroundOverlay(Ppu *ppu, uint y, bool sub,
     int x = i - kPpuExtraLeftRight;
     if (remove && x >= capture->x0 && x < capture->x1)
       continue;
-    if (src[i] > dst[i])
+    if (src[i] > dst[i]) {
       dst[i] = src[i];
+      if (PpuIdentOn(ppu))
+        PpuIdentMerge(ppu, &ppu->bgBuffers[sub], (size_t)i, layerbuf,
+                      (size_t)i, true);
+    } else if (PpuIdentOn(ppu)) {
+      PpuIdentMerge(ppu, &ppu->bgBuffers[sub], (size_t)i, layerbuf,
+                    (size_t)i, false);
+    }
   }
 }
 
@@ -2122,6 +2393,19 @@ static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
     uint8 *dst = &ppu->renderBuffer[(y - 1) * ppu->renderPitch];
     size_t n = sizeof(uint32) * (256 + ppu->extraLeftRight * 2);
     memset(dst, 0, n);
+    if (ppu->identPixels) {
+      PpuIdentityPixel *row = ppu->identPixels + (size_t)(y - 1) * ppu->identPitch;
+      for (size_t x = 0; x < 256 + (size_t)ppu->extraLeftRight * 2 &&
+                         x < ppu->identPitch; x++) {
+        memset(&row[x], 0, sizeof(row[x]));
+        row[x].flags = kPpuIdentFlag_Composed | kPpuIdentFlag_Black;
+      }
+      PpuIdentityLine *line = &ppu->identLines[y - 1];
+      memcpy(line->cgram, ppu->cgram, sizeof(line->cgram));
+      line->fixed_color = ppu->fixedColor;
+      line->brightness = PPU_brightness(ppu);
+      line->composed = 1;
+    }
     return;
   }
 
@@ -2216,6 +2500,34 @@ static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
   uint32 hud_world_left = kPpuExtraLeftRight - ppu->extraLeftCur;
   uint32 hud_world_right = kPpuExtraLeftRight + 256 + ppu->extraRightCur;
 
+  PpuIdentityPixel *ident_row = NULL;
+  if (ppu->identPixels) {
+    ident_row = ppu->identPixels + (size_t)(y - 1) * ppu->identPitch;
+    PpuIdentityLine *line = &ppu->identLines[y - 1];
+    memcpy(line->cgram, ppu->cgram, sizeof(line->cgram));
+    line->fixed_color = ppu->fixedColor;
+    line->brightness = PPU_brightness(ppu);
+    line->composed = 1;
+  }
+#define IDENT_EMIT(flags_, sub_from_buffer) do { \
+    const size_t ox = (size_t)(dst - dst_org); \
+    if (ident_row && ox < ppu->identPitch) { \
+      PpuIdentityPixel *gp = &ident_row[ox]; \
+      gp->main_ref = PpuIdentRef(ppu, &ppu->bgBuffers[0], i); \
+      gp->main_index = (uint8_t)(pixel & 0xff); \
+      gp->main_layer = (uint8_t)((pixel >> 8) & 0xf); \
+      gp->flags = (uint8_t)(kPpuIdentFlag_Composed | (flags_)); \
+      PpuIdentEmitShape(ppu, gp, &ppu->bgBuffers[0], i); \
+      if (sub_from_buffer) { \
+        gp->sub_ref = PpuIdentRef(ppu, &ppu->bgBuffers[1], i); \
+        gp->sub_index = (uint8_t)(ppu->bgBuffers[1].data[i] & 0xff); \
+      } else { \
+        gp->sub_ref = 0; \
+        gp->sub_index = 0; \
+      } \
+    } \
+  } while (0)
+
   uint32 windex = 0;
   do {
     uint32 left = cwin.edges[windex] + kPpuExtraLeftRight, right = cwin.edges[windex + 1] + kPpuExtraLeftRight;
@@ -2237,11 +2549,13 @@ static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
              (main_layer == 4 || main_layer == 6));
         if (outside_world && !keep_hud) {
           dst[0] = 0;
+          IDENT_EMIT(kPpuIdentFlag_Black, false);
         } else {
           uint32 color = ppu->cgram[pixel & 0xff];
           dst[0] = ppu->brightnessMult[color & clip_color_mask] << 16 |
             ppu->brightnessMult[(color >> 5) & clip_color_mask] << 8 |
             ppu->brightnessMult[(color >> 10) & clip_color_mask];
+          IDENT_EMIT(clip_color_mask ? 0 : kPpuIdentFlag_Clip, false);
         }
       } while (dst++, ++i < right);
     } else {
@@ -2261,23 +2575,32 @@ static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
              (main_layer == 4 || main_layer == 6));
         if (outside_world && !keep_hud) {
           dst[0] = 0;
+          IDENT_EMIT(kPpuIdentFlag_Black, false);
         } else {
+          uint32 ident_flags = clip_color_mask ? 0 : kPpuIdentFlag_Clip;
+          bool ident_sub = false;
           uint32 color = ppu->cgram[pixel & 0xff], color2;
           uint32 r = color & clip_color_mask;
           uint32 g = (color >> 5) & clip_color_mask;
           uint32 b = (color >> 10) & clip_color_mask;
           uint8 *color_map = ppu->brightnessMult;
           if (math_enabled_cur & (1 << main_layer)) {
+            ident_flags |= kPpuIdentFlag_Math;
             if (math_enabled_cur & 0x100) {  // addSubscreen ?
               if ((ppu->bgBuffers[1].data[i] & 0xff) != 0)
-                color2 = ppu->cgram[ppu->bgBuffers[1].data[i] & 0xff], color_map = half_color_map;
+                color2 = ppu->cgram[ppu->bgBuffers[1].data[i] & 0xff], color_map = half_color_map,
+                ident_sub = true;
               else  // Don't halve if PPU_addSubscreen(ppu) && backdrop
-                color2 = fixed_color;
+                color2 = fixed_color, ident_flags |= kPpuIdentFlag_SubFixed;
             } else {
-              color2 = fixed_color, color_map = half_color_map;
+              color2 = fixed_color, color_map = half_color_map,
+              ident_flags |= kPpuIdentFlag_SubFixed;
             }
+            if (color_map == ppu->brightnessMultHalf)
+              ident_flags |= kPpuIdentFlag_Half;
             uint32 r2 = (color2 & 0x1f), g2 = ((color2 >> 5) & 0x1f), b2 = ((color2 >> 10) & 0x1f);
             if (math_enabled_cur & 0x200) {  // subtractColor?
+              ident_flags |= kPpuIdentFlag_Subtract;
               r = (r >= r2) ? r - r2 : 0;
               g = (g >= g2) ? g - g2 : 0;
               b = (b >= b2) ? b - b2 : 0;
@@ -2288,10 +2611,12 @@ static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
             }
           }
           dst[0] = color_map[b] | color_map[g] << 8 | color_map[r] << 16;
+          IDENT_EMIT(ident_flags, ident_sub);
         }
       } while (dst++, ++i < right);
     }
   } while (cw_clip_math >>= 1, ++windex < cwin.nr);
+#undef IDENT_EMIT
 
   PpuWriteOverlayRenderLine(ppu, kPpuOverlaySource_Obj, y);
   if (perf_enabled)
@@ -2363,6 +2688,7 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
         (ppu->extraLeftCur + ppu->extraRightCur + 7) / 8;
   }
   const int spriteLimit = 32 + widescreenBudget;
+  const bool ident_on = PpuIdentOn(ppu);
   const int tileLimit = 34 + widescreenBudget;
 
   // Range evaluation walks OAM forward, but tile fetching walks the accepted
@@ -2449,7 +2775,23 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
               uint32 bits = plane >> shift;
         int pixel = (bits >> 0) & 1 | (bits >> 7) & 2 |
                     (bits >> 14) & 4 | (bits >> 21) & 8;
-        if (pixel == 0) continue;
+        if (pixel == 0) {
+          if (ident_on) {
+            /* Transparent here, drawn above whatever is already in the OBJ
+             * line (lower OAM indices are processed later). */
+            PpuIdentity *e =
+                &ppu->objBuffer.cover[dst - ppu->objBuffer.data];
+            e->z = z;
+            e->gen = ppu->identGen;
+            e->addr = (uint16_t)((addr - ppu->vram) & 0x7fff);
+            e->meta = (uint8_t)((7 - shift) |
+                ((oam1 & 0x4000) ? kPpuIdentMeta_HFlip : 0) |
+                ((oam1 & 0x8000) ? kPpuIdentMeta_VFlip : 0) |
+                (kPpuIdentDepth_4bpp << kPpuIdentMeta_DepthShift));
+            e->pad = 0;
+          }
+          continue;
+        }
               if (capture_slot) {
                 int screen_x = col + x + px;
                 if (screen_x >= obj_capture->x0 && screen_x < obj_capture->x1) {
@@ -2462,6 +2804,22 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
               }
         // Lower OAM indices are processed later and overwrite higher ones.
                 dst[0] = z + pixel;
+              if (ident_on) {
+                const size_t oi = (size_t)(dst - ppu->objBuffer.data);
+                PpuIdentity e;
+                e.z = dst[0];
+                e.gen = ppu->identGen;
+                e.addr = (uint16_t)((addr - ppu->vram) & 0x7fff);
+                e.meta = (uint8_t)((7 - shift) |
+                    ((oam1 & 0x4000) ? kPpuIdentMeta_HFlip : 0) |
+                    ((oam1 & 0x8000) ? kPpuIdentMeta_VFlip : 0) |
+                    (kPpuIdentDepth_4bpp << kPpuIdentMeta_DepthShift));
+                e.pad = 0;
+                /* Later OAM entries draw on top: an earlier cover here is
+                 * now underneath this pixel. */
+                memset(&ppu->objBuffer.cover[oi], 0, sizeof(PpuIdentity));
+                PpuIdentPushTop(ppu, &ppu->objBuffer, oi, &e);
+              }
             }
         }
         if(tilesFound > tileLimit &&

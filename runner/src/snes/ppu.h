@@ -42,12 +42,90 @@ enum {
 
 typedef uint16_t PpuZbufType;
 
+/* Host-only tile identity of one priority-buffer entry (see
+ * PpuSetIdentityCapture). An entry describes data[i] only while its z equals
+ * data[i] and its gen equals the line being drawn, so a draw path that does
+ * not record identity yields "unknown", never a stale or wrong tile. */
+typedef struct PpuIdentity {
+  PpuZbufType z;
+  uint16_t gen;
+  uint16_t addr;  /* VRAM word address of the character row */
+  uint8_t meta;   /* kPpuIdentMeta_* */
+  uint8_t pad;
+} PpuIdentity;
+
 typedef struct PpuPixelPrioBufs {
   // This holds the prio in the upper 8 bits and the color in the lower 8 bits.
   // Sized for the widescreen border; logical screen x maps to
   // data[x + kPpuExtraLeftRight].
   PpuZbufType data[kPpuBufWidth];
+  PpuIdentity ident[kPpuBufWidth];  /* the pixel in data[] */
+  PpuIdentity under[kPpuBufWidth];  /* next opaque pixel below it; z low
+                                       byte 0 = backdrop */
+  PpuIdentity cover[kPpuBufWidth];  /* highest tile above it that is
+                                       transparent here; z low byte =
+                                       palette base */
 } PpuPixelPrioBufs;
+
+/* Identity capture output: one entry per renderBuffer pixel plus one record
+ * per visible line. `ref` packs where the pixel's texel lives in VRAM:
+ *   bits 0-14  character row word address (character base + row, row = bits 0-2)
+ *   bits 15-17 texel column within the stored character (0 = leftmost)
+ *   bit  18/19 horizontal/vertical flip of the tile on screen
+ *   bits 20-21 depth: 0 = 2bpp, 1 = 4bpp, 2 = 8bpp
+ *   bit  31    valid
+ * `index` is the CGRAM index the native pixel used (0 = backdrop). The flags
+ * record how the native renderer combined main and sub screen, so a host can
+ * recompose a substituted texel with the exact same color math. */
+enum {
+  kPpuIdentMeta_ColMask = 7,
+  kPpuIdentMeta_HFlip = 1 << 3,
+  kPpuIdentMeta_VFlip = 1 << 4,
+  kPpuIdentMeta_DepthShift = 5,
+
+  kPpuIdentRef_ColShift = 15,
+  kPpuIdentRef_HFlip = 1 << 18,
+  kPpuIdentRef_VFlip = 1 << 19,
+  kPpuIdentRef_DepthShift = 20,
+  kPpuIdentRef_Valid = 1u << 31,
+
+  kPpuIdentDepth_2bpp = 0,
+  kPpuIdentDepth_4bpp = 1,
+  kPpuIdentDepth_8bpp = 2,
+
+  kPpuIdentFlag_Composed = 1 << 0,  /* written by the compositor this frame */
+  kPpuIdentFlag_Black = 1 << 1,     /* outside the live world span */
+  kPpuIdentFlag_Clip = 1 << 2,      /* color window zeroed the main color */
+  kPpuIdentFlag_Math = 1 << 3,      /* color math applied to this pixel */
+  kPpuIdentFlag_Subtract = 1 << 4,
+  kPpuIdentFlag_Half = 1 << 5,
+  kPpuIdentFlag_SubFixed = 1 << 6,  /* math operand was the fixed color */
+};
+
+typedef struct PpuIdentityPixel {
+  uint32_t main_ref;
+  uint32_t sub_ref;
+  /* Main screen only: what lies under the main pixel (under_index 0 =
+   * backdrop) and the tile above it that is transparent at this pixel. A
+   * host can then reshape silhouettes at sub-pixel resolution. */
+  uint32_t under_ref;
+  uint32_t cover_ref;
+  uint8_t main_index;
+  uint8_t sub_index;
+  uint8_t flags;
+  uint8_t main_layer;  /* PPU layer type nibble of the main pixel */
+  uint8_t under_index;
+  uint8_t cover_base;  /* CGRAM palette base of the cover tile */
+  uint8_t under_layer;
+  uint8_t cover_layer;
+} PpuIdentityPixel;
+
+typedef struct PpuIdentityLine {
+  uint16_t cgram[0x100];  /* CGRAM as this line was composed */
+  uint16_t fixed_color;
+  uint8_t brightness;     /* INIDISP brightness 0-15 */
+  uint8_t composed;
+} PpuIdentityLine;
 
 static inline void PpuWidescreenAdjustPinnedWindowEdges(
     int screen_left, int screen_right, int *w1l, int *w1r, int *w2l,
@@ -284,6 +362,12 @@ struct Ppu {
   PpuWidescreenLineEnhancer *widescreenLineEnhancer;
   void *widescreenLineEnhancerContext;
 
+  /* Host-only tile identity capture (PpuSetIdentityCapture). NULL = off. */
+  PpuIdentityPixel *identPixels;
+  PpuIdentityLine *identLines;
+  uint32_t identPitch;  /* entries per identPixels row */
+  uint16_t identGen;    /* current line generation; never 0 while drawing */
+
   // -- START OF SNAPSHOT, 0x10420 bytes
   uint16_t cgram[0x100];
   uint16_t oam[0x100];
@@ -455,6 +539,17 @@ bool PpuSetOverlayCapture(Ppu *ppu, PpuOverlaySource source,
 // Select a contiguous OAM slot range for an already configured OBJ capture.
 // The game remains responsible for validating what those slots represent.
 bool PpuSetOverlayOamRange(Ppu *ppu, uint8_t first, uint8_t count);
+
+// Record, for every composed pixel, which character texel produced its main
+// and sub screen colors (PpuIdentityPixel) plus per-line CGRAM, fixed color
+// and brightness (PpuIdentityLine, 224 entries). `pixels` uses the same
+// coordinate system as renderBuffer with `pitch` entries per row. Presentation
+// only: rendering output, timing and every serialized byte are unchanged.
+// Coverage: Mode 1 BG1/BG2 (4bpp, incl. widescreen shadow and margin merges),
+// BG3 (2bpp) and OBJ. Mosaic, big tiles, Mode 2/3/7 report no identity.
+// Pass NULL to disable (the default).
+void PpuSetIdentityCapture(Ppu *ppu, PpuIdentityPixel *pixels, size_t pitch,
+                           PpuIdentityLine *lines);
 
 // Set the symmetric widescreen border, in pixels per side (clamped to
 // kPpuExtraLeftRight). 0 restores authentic 256-wide rendering. The internal
