@@ -224,6 +224,17 @@ void apu_cycle(Apu* apu) {
 
   // handle timers
   extern uint64_t g_apu_timer0_total_ticks;
+  /* Fast path, same result as the loop: when no divider period ends this
+   * cycle (15 cycles in 16), the loop only counts the three down. */
+  if ((apu->timer[0].cycles != 0) & (apu->timer[1].cycles != 0) &
+      (apu->timer[2].cycles != 0)) {
+    apu->timer[0].cycles--;
+    apu->timer[1].cycles--;
+    apu->timer[2].cycles--;
+    apu->cycles++;
+    apu->portClock++;
+    return;
+  }
   for(int i = 0; i < 3; i++) {
     if(apu->timer[i].cycles == 0) {
       apu->timer[i].cycles = i == 2 ? 16 : 128;

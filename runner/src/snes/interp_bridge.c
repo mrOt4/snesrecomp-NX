@@ -635,6 +635,71 @@ static void tier2_record(uint32_t site, uint32_t target, uint8_t mx,
                          uint8_t kind, int clean);
 static uint8_t tier2_entry_mx(const CpuState *cpu);
 
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
+/* SNESRECOMP_INTERP_HIST=1 (diagnostic, default off): count interpreted
+ * instructions per 24-bit PC and print the busiest at exit, to find the
+ * routines that run without a recompiled body. */
+static uint32_t *s_interp_hist;
+
+static void InterpHistReport(void) {
+    enum { kTop = 40 };
+    uint32_t top_pc[kTop] = {0};
+    uint64_t top_n[kTop] = {0};
+    uint64_t total = 0;
+    for (uint32_t pc = 0; pc < (1u << 24); pc++) {
+        const uint32_t n = s_interp_hist[pc];
+        total += n;
+        if (n <= top_n[kTop - 1])
+            continue;
+        int at = kTop - 1;
+        while (at > 0 && top_n[at - 1] < n) {
+            top_n[at] = top_n[at - 1];
+            top_pc[at] = top_pc[at - 1];
+            at--;
+        }
+        top_n[at] = n;
+        top_pc[at] = pc;
+    }
+    fprintf(stderr, "[interp-hist] %llu interpreted instructions\n",
+            (unsigned long long)total);
+    for (int i = 0; i < kTop && top_n[i]; i++)
+        fprintf(stderr, "[interp-hist] $%06X %llu (%.1f%%)\n",
+                (unsigned)top_pc[i], (unsigned long long)top_n[i],
+                100.0 * (double)top_n[i] / (double)total);
+}
+
+static void InterpHistNote(uint32_t pc) {
+    s_interp_hist[pc & 0xFFFFFFu]++;
+}
+
+static void InterpHistInit(void) {
+    static int init;
+    if (init)
+        return;
+    init = 1;
+    const char *v = getenv("SNESRECOMP_INTERP_HIST");
+    if (v && *v && *v != '0' &&
+        (s_interp_hist = calloc(1u << 24, sizeof *s_interp_hist)) != NULL)
+        atexit(InterpHistReport);
+}
+
+/* Quiescence detector helpers (see qbucket in _interp_run_core). */
+static inline unsigned QuiescentBucket(uint32_t pc) {
+    return (unsigned)((pc ^ (pc >> 6) ^ (pc >> 12) ^ (pc >> 18)) & 63u);
+}
+
+static inline unsigned LowestSetBit64(uint64_t value) {
+#if defined(_MSC_VER)
+    unsigned long index;
+    _BitScanForward64(&index, value);
+    return (unsigned)index;
+#else
+    return (unsigned)__builtin_ctzll(value);
+#endif
+}
+
 /* Core: interpret from entry_pc24 until an RTS/RTL leaves cpu->S strictly
  * above `s_exit` (the routine returned to its caller). `s_exit` is the FRAME
  * BASE to unwind to — for a tail-dispatch / PEA+JMP re-interpret it is the
@@ -722,13 +787,23 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
     } QuiescentState;
     QuiescentState qring[64];
     memset(qring, 0, sizeof qring);
+    /* Ring slots grouped by a hash of their PC. Only a same-PC entry can
+     * match, so the search below visits just those slots, still in
+     * ascending slot order: the first match (and every result) is the same
+     * as a full scan of all 64 slots. */
+    uint64_t qbucket[64];
+    uint64_t qused = 0;
+    memset(qbucket, 0, sizeof qbucket);
 
+    InterpHistInit();
     const long step_cap = interp_step_cap();
     long steps = 0;
     uint64_t progress_write_epoch=g_interp_bridge_write_epoch;
     uint64_t progress_dynamic_epoch=s_interp_dynamic_progress_epoch;
     for (; steps < step_cap; steps++) {
         const uint32_t pc_before = ((uint32_t)in.k << 16) | in.pc;
+        if (s_interp_hist)
+            InterpHistNote(pc_before);
 #if SNESRECOMP_REVERSE_DEBUG
         /* The reverse debugger must observe whichever execution tier owns the
          * next guest instruction. AOT blocks arrive through cpu_trace_block;
@@ -777,17 +852,22 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
             now.d=in.d; now.mf=in.mf; now.xf=in.xf; now.e=in.e;
             now.write_epoch=g_interp_bridge_write_epoch; now.step=steps;
             now.continuous_read_epoch=s_interp_continuous_read_epoch;
-            for (unsigned qi=0; qi<64; qi++) {
+            for (uint64_t qcand = qbucket[QuiescentBucket(now.pc)]; qcand;
+                 qcand &= qcand - 1) {
+                const unsigned qi = LowestSetBit64(qcand);
                 QuiescentState *old=&qring[qi];
-                if (old->step && steps-old->step<=64 &&
+                /* The epochs first: they differ for every older entry of a
+                 * live MMIO poll, so most candidates fail on one compare.
+                 * (A conjunction without side effects: same result.) */
+                if (old->continuous_read_epoch==now.continuous_read_epoch &&
+                    old->write_epoch==now.write_epoch &&
+                    old->step && steps-old->step<=64 &&
                     old->pc==now.pc && old->a==now.a && old->x==now.x &&
                     old->y==now.y && old->sp==now.sp && old->dp==now.dp &&
                     old->db==now.db && old->k==now.k && old->c==now.c &&
                     old->z==now.z && old->v==now.v && old->n==now.n &&
                     old->i==now.i && old->d==now.d && old->mf==now.mf &&
-                    old->xf==now.xf && old->e==now.e &&
-                    old->write_epoch==now.write_epoch &&
-                    old->continuous_read_epoch==now.continuous_read_epoch) {
+                    old->xf==now.xf && old->e==now.e) {
                     now.repeats=old->repeats+1;
                     if (now.repeats>=2) {
                         /* Stable CPU/memory state is a genuine cooperative
@@ -807,7 +887,15 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
                     break;
                 }
             }
-            qring[steps & 63]=now;
+            {
+                const unsigned slot = (unsigned)(steps & 63);
+                const uint64_t bit = 1ull << slot;
+                if (qused & bit)
+                    qbucket[QuiescentBucket(qring[slot].pc)] &= ~bit;
+                qring[slot]=now;
+                qbucket[QuiescentBucket(now.pc)] |= bit;
+                qused |= bit;
+            }
         }
         if (s_pre_opcode_hook_count > 0) {
             const uint32_t key = pc_before & 0x7FFFFFu;
@@ -2243,6 +2331,7 @@ void Tier2CoverageWriteManifest(const char *path, const char *rom_title) {
 }
 
 void Tier2CoverageWriteDefaultManifest(const char *rom_title) {
+    if (!tier2_capture_enabled()) return;
     const char *path = tier2_capture_manifest_path(rom_title);
     Tier2CoverageWriteManifest(path, rom_title);
     if (tier2_verbose())

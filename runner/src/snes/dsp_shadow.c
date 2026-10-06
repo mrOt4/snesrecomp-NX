@@ -67,7 +67,7 @@ static void shadow_render_dry(DspShadow* sh, Dsp* dsp, float* dryLOut,
   *dryROut = dryR;
 }
 
-#if defined(SNESRECOMP_TRACE)
+#if defined(SNESRECOMP_TRACE) && SNESRECOMP_TRACE
 // blargg (snes9x/bsnes) reference Gaussian, applied to the canonical gaussValues
 // table (verified byte-identical to blargg's gauss[512]). The ONLY difference
 // vs canon dsp_getSample: blargg shifts >>11 per term with the intermediate
@@ -92,7 +92,7 @@ static int ref_gauss(const int16_t* buf, int n, int offset) {
 // HALF scale (compensated later by the Gaussian >>10 vs blargg >>11), so the
 // reference is seeded with 2x canon's prior samples and the comparison is canon*2
 // vs the reference. Isolates the BRR filter/shift/clamp logic vs the gold standard.
-#if defined(SNESRECOMP_TRACE)
+#if defined(SNESRECOMP_TRACE) && SNESRECOMP_TRACE
 void dsp_shadow_verify_brr(const uint8_t* aram, uint16_t blockStart,
                            int oldSeed, int olderSeed, const int16_t* canonOut16) {
   int header = aram[blockStart];
@@ -132,7 +132,7 @@ void dsp_shadow_verify_brr(const uint8_t* aram, uint16_t blockStart,
 // Faithful echo-FIR reference = blargg's snes9x/bsnes CALC_FIR: taps 0-6 summed,
 // (int16) clip, then tap 7 added as (int16), CLAMP16, clear LSB. Production
 // mirrors this sequence; the reference remains an independent bit-exact check.
-#if defined(SNESRECOMP_TRACE)
+#if defined(SNESRECOMP_TRACE) && SNESRECOMP_TRACE
 static int ref_echo_fir(const int16_t* fir, const int8_t* coeff, int idx) {
   int sum = 0;
   for (int i = 0; i < 7; i++)
@@ -164,7 +164,7 @@ void dsp_shadow_process(DspShadow* sh, Dsp* dsp, int canonL, int canonR,
   *outL = canonL;
   *outR = canonR;
   if (!sh) return;
-#if !defined(SNESRECOMP_TRACE)
+#if !(defined(SNESRECOMP_TRACE) && SNESRECOMP_TRACE)
   // Production: only pay the re-render cost when the enhancement is armed.
   if (!sh->enabled) return;
 #endif
@@ -175,7 +175,7 @@ void dsp_shadow_process(DspShadow* sh, Dsp* dsp, int canonL, int canonR,
   float dryL, dryR;
   shadow_render_dry(sh, dsp, &dryL, &dryR);
 
-#if defined(SNESRECOMP_TRACE)
+#if defined(SNESRECOMP_TRACE) && SNESRECOMP_TRACE
   // Accumulate only on non-silent canon samples so the RMS reflects active
   // audio rather than boot/silence. Normalized to [-1,1] by 16-bit full scale.
   if (canonL != 0 || canonR != 0) {

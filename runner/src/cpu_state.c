@@ -325,7 +325,69 @@ static uint16 cpu_latch_read16(CpuState *cpu, uint16 value) {
     return value;
 }
 
+/* ROM pages: for each 4 KiB page of the 24-bit address space, a direct
+ * pointer when every byte of it is plain cartridge ROM (no WRAM, register,
+ * SRAM or coprocessor window, and contiguous in the image), else NULL.
+ * cpu_read8 reads such pages without walking its routing chain: the result
+ * is the same byte RomPtr would return, with the same bus note and open-bus
+ * latch. Rebuilt whenever the cart, its ROM image or the SRAM changes.
+ * Carts with coprocessors keep the full chain. */
+static const uint8 *s_rom_page[256 * 16];
+static const void *s_rom_page_cart, *s_rom_page_image, *s_rom_page_sram;
+static int s_rom_page_sram_size = -1;
+
+static void BuildRomPages(Cart *cart) {
+    memset(s_rom_page, 0, sizeof s_rom_page);
+    s_rom_page_cart = cart;
+    s_rom_page_image = cart->rom;
+    s_rom_page_sram = g_sram;
+    s_rom_page_sram_size = g_sram_size;
+    if (!cart->rom || cart->type == CART_SUPERFX || cart->type == CART_SA1 ||
+        cart->type == CART_CX4 || cart_has_dsp1(cart))
+        return;
+    for (int bank = 0; bank < 256; bank++) {
+        if (bank == 0x7e || bank == 0x7f)
+            continue;
+        for (int page = 0; page < 16; page++) {
+            const uint16 first = (uint16)(page << 12);
+            bool plain = true;
+            for (int step = 0; step < 16 && plain; step++) {
+                const uint16 a0 = (uint16)(first + (step << 8));
+                const uint16 a1 = (uint16)(a0 + 0xff);
+                plain = cpu_wram_offset((uint8)bank, a0) < 0 &&
+                        cpu_wram_offset((uint8)bank, a1) < 0 &&
+                        !is_hw_reg((uint8)bank, a0) &&
+                        !is_hw_reg((uint8)bank, a1) &&
+                        cpu_sram_offset((uint8)bank, a0) < 0 &&
+                        cpu_sram_offset((uint8)bank, a1) < 0;
+            }
+            if (!plain)
+                continue;
+            const uint8 *p0 = cart_getRomPtr(cart, (uint8)bank, first);
+            const uint8 *p1 =
+                cart_getRomPtr(cart, (uint8)bank, (uint16)(first + 0xfff));
+            if (p0 && p1 && p1 - p0 == 0xfff)
+                s_rom_page[bank << 4 | page] = p0;
+        }
+    }
+}
+
+static inline const uint8 *RomPage(uint8 bank, uint16 addr) {
+    Cart *cart = g_snes ? g_snes->cart : NULL;
+    if (!cart)
+        return NULL;
+    if (cart != s_rom_page_cart || cart->rom != s_rom_page_image ||
+        g_sram != s_rom_page_sram || g_sram_size != s_rom_page_sram_size)
+        BuildRomPages(cart);
+    return s_rom_page[(unsigned)bank << 4 | addr >> 12];
+}
+
 uint8 cpu_read8(CpuState *cpu, uint8 bank, uint16 addr) {
+    const uint8 *page = RomPage(bank, addr);
+    if (page) {
+        cart_note_cpu_bus(g_snes->cart, bank, addr);
+        return cpu_latch_read8(cpu, page[addr & 0xfff]);
+    }
     if (g_snes && g_snes->cart)
         cart_note_cpu_bus(g_snes->cart, bank, addr);
     int off = cpu_wram_offset(bank, addr);

@@ -239,6 +239,10 @@ void PpuSetIdentityCapture(Ppu *ppu, PpuIdentityPixel *pixels, size_t pitch,
   ppu->identPitch = on ? (uint32_t)pitch : 0;
 }
 
+void PpuSetIdentityShape(Ppu *ppu, bool enabled) {
+  ppu->identLite = !enabled;
+}
+
 static FORCEINLINE bool PpuIdentOn(const Ppu *ppu) {
   return ppu->identPixels != NULL;
 }
@@ -265,12 +269,6 @@ static FORCEINLINE PpuIdentity PpuIdentBackdrop(const Ppu *ppu) {
   return e;
 }
 
-static void PpuIdentClear(PpuPixelPrioBufs *buf) {
-  memset(buf->ident, 0, sizeof buf->ident);
-  memset(buf->under, 0, sizeof buf->under);
-  memset(buf->cover, 0, sizeof buf->cover);
-}
-
 /* The new top pixel of buf at i: its predecessor becomes the under pixel. */
 static FORCEINLINE void PpuIdentPushTop(Ppu *ppu, PpuPixelPrioBufs *buf,
                                         size_t i, const PpuIdentity *top) {
@@ -281,17 +279,25 @@ static FORCEINLINE void PpuIdentPushTop(Ppu *ppu, PpuPixelPrioBufs *buf,
   buf->ident[i] = *top;
 }
 
-static unsigned PpuIdentTexel(const Ppu *ppu, unsigned row_addr,
-                              unsigned depth, unsigned col) {
-  const unsigned bit = 7 - col;
-  const uint16 p01 = ppu->vram[row_addr & 0x7fff];
-  unsigned value = ((p01 >> bit) & 1) | (((p01 >> (bit + 8)) & 1) << 1);
-  if (depth != kPpuIdentDepth_2bpp) {
-    const uint16 p23 = ppu->vram[(row_addr + 8) & 0x7fff];
-    value |= (((p23 >> bit) & 1) << 2) | (((p23 >> (bit + 8)) & 1) << 3);
-  }
-  return value;
-}
+/* kPpuIdentPlaneSpread[b]: bit (7 - col) of a plane byte moved to bit
+ * 4 * col, so four shifted lookups OR'd give the row's eight texels. */
+static const uint32_t kPpuIdentPlaneSpread[256] = {
+#define PPU_SPREAD(b) \
+  ((((b) >> 7) & 1u) | (((b) >> 6) & 1u) << 4 | (((b) >> 5) & 1u) << 8 | \
+   (((b) >> 4) & 1u) << 12 | (((b) >> 3) & 1u) << 16 | \
+   (((b) >> 2) & 1u) << 20 | (((b) >> 1) & 1u) << 24 | ((b) & 1u) << 28)
+#define PPU_SPREAD4(b) PPU_SPREAD(b), PPU_SPREAD((b) + 1), \
+                       PPU_SPREAD((b) + 2), PPU_SPREAD((b) + 3)
+#define PPU_SPREAD16(b) PPU_SPREAD4(b), PPU_SPREAD4((b) + 4), \
+                        PPU_SPREAD4((b) + 8), PPU_SPREAD4((b) + 12)
+#define PPU_SPREAD64(b) PPU_SPREAD16(b), PPU_SPREAD16((b) + 16), \
+                        PPU_SPREAD16((b) + 32), PPU_SPREAD16((b) + 48)
+  PPU_SPREAD64(0), PPU_SPREAD64(64), PPU_SPREAD64(128), PPU_SPREAD64(192),
+#undef PPU_SPREAD64
+#undef PPU_SPREAD16
+#undef PPU_SPREAD4
+#undef PPU_SPREAD
+};
 
 static void PpuIdentSpan(Ppu *ppu, PpuPixelPrioBufs *buf,
                          const PpuZbufType *seg, int count, int s0,
@@ -302,19 +308,34 @@ static void PpuIdentSpan(Ppu *ppu, PpuPixelPrioBufs *buf,
   const uint8_t meta_flags = (uint8_t)((hflip ? kPpuIdentMeta_HFlip : 0) |
       ((tile & 0x8000) ? kPpuIdentMeta_VFlip : 0) |
       (depth << kPpuIdentMeta_DepthShift));
+  /* The character row's planes, read once for the whole span, unpacked to
+   * one texel per nibble: nibble `col` is the texel of character column
+   * col (plane n in bit n), as the per-pixel shifts used to compute. */
+  const uint16 p01 = ppu->vram[row_addr & 0x7fff];
+  const uint16 p23 = depth != kPpuIdentDepth_2bpp
+                         ? ppu->vram[(row_addr + 8) & 0x7fff] : 0;
+  const uint32_t texels = kPpuIdentPlaneSpread[p01 & 0xff] |
+                          kPpuIdentPlaneSpread[p01 >> 8] << 1 |
+                          kPpuIdentPlaneSpread[p23 & 0xff] << 2 |
+                          kPpuIdentPlaneSpread[p23 >> 8] << 3;
+  PpuIdentity e;
+  e.gen = ppu->identGen;
+  e.addr = (uint16_t)(row_addr & 0x7fff);
+  e.pad = 0;
   for (int j = 0; j < count; j++) {
     const int s = s0 + j;
     const unsigned col = hflip ? 7 - s : s;
-    const unsigned texel = PpuIdentTexel(ppu, row_addr, depth, col);
+    const unsigned texel = (texels >> (4 * col)) & 0xf;
     const PpuZbufType v = seg[j];
-    PpuIdentity e;
-    e.gen = ppu->identGen;
-    e.addr = (uint16_t)(row_addr & 0x7fff);
     e.meta = (uint8_t)(col | meta_flags);
-    e.pad = 0;
     if (texel && (v >> 8) == (z >> 8) && (v & 0xff)) {
       e.z = v;  /* this tile won the pixel */
-      PpuIdentPushTop(ppu, buf, base + j, &e);
+      if (!ppu->identLite)
+        PpuIdentPushTop(ppu, buf, base + j, &e);
+      else
+        buf->ident[base + j] = e;
+    } else if (ppu->identLite) {
+      continue;
     } else if (texel) {
       e.z = (PpuZbufType)(z + texel);  /* opaque but below the top pixel */
       if ((e.z >> 8) < (v >> 8))
@@ -331,6 +352,11 @@ static void PpuIdentSpan(Ppu *ppu, PpuPixelPrioBufs *buf,
 static void PpuIdentMerge(Ppu *ppu, PpuPixelPrioBufs *dst, size_t di,
                           const PpuPixelPrioBufs *src, size_t si,
                           bool src_wins) {
+  if (ppu->identLite) {
+    if (src_wins)
+      dst->ident[di] = src->ident[si];
+    return;
+  }
   if (src_wins) {
     PpuIdentity under = PpuIdentLive(ppu, &dst->under[di])
                             ? dst->under[di] : PpuIdentBackdrop(ppu);
@@ -387,6 +413,8 @@ static void PpuIdentEmitShape(const Ppu *ppu, PpuIdentityPixel *gp,
   gp->cover_base = 0;
   gp->under_layer = 0;
   gp->cover_layer = 0;
+  if (ppu->identLite)
+    return;
   if (gp->main_ref && under->gen == ppu->identGen && (under->z >> 8) < (top >> 8)) {
     gp->under_index = (uint8_t)(under->z & 0xff);
     gp->under_layer = (uint8_t)((under->z >> 8) & 0xf);
@@ -1087,10 +1115,10 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
           ws_bias[windex])
 #define DO_PIXEL(i) do { \
   pixel = (bits >> i) & 1 | (bits >> (7 + i)) & 2 | (bits >> (14 + i)) & 4 | (bits >> (21 + i)) & 8; \
-  if (VIEWPORT_ALLOWED(i) && (bits & (0x01010101 << i)) && z > dstz[i]) dstz[i] = z + pixel; } while (0)
+  if ((bits & (0x01010101 << i)) && z > dstz[i] && VIEWPORT_ALLOWED(i)) dstz[i] = z + pixel; } while (0)
 #define DO_PIXEL_HFLIP(i) do { \
   pixel = (bits >> (7 - i)) & 1 | (bits >> (14 - i)) & 2 | (bits >> (21 - i)) & 4 | (bits >> (28 - i)) & 8; \
-  if (VIEWPORT_ALLOWED(i) && (bits & (0x80808080 >> i)) && z > dstz[i]) dstz[i] = z + pixel; } while (0)
+  if ((bits & (0x80808080 >> i)) && z > dstz[i] && VIEWPORT_ALLOWED(i)) dstz[i] = z + pixel; } while (0)
 #define READ_BITS(ta, tile) (addr = &ppu->vram[((ta) + (tile) * 16) & 0x7fff], addr[0] | addr[8] << 16)
   enum { kPaletteShift = 6 };
   if (!IS_SCREEN_ENABLED(ppu, sub, layer))
@@ -1956,10 +1984,10 @@ static void PpuDrawBackground_4bpp_policy(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
     return;
   }
 
-  PpuPixelPrioBufs layerbuf;
+  /* Static: identity entries are line-generation stamped, so a reused
+   * buffer needs no clearing (an 11 KiB memset per layer and line). */
+  static PpuPixelPrioBufs layerbuf;
   ClearBackdrop(&layerbuf);
-  if (PpuIdentOn(ppu))
-    PpuIdentClear(&layerbuf);
   if (PPU_bigTiles(ppu, layer))
     PpuDrawBackgroundBig(ppu, &layerbuf, y, sub, layer, 4, zhi, zlo, mosaic);
   else if (mosaic)
@@ -2003,10 +2031,10 @@ static void PpuDrawBackground_2bpp_policy(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
     return;
   }
 
-  PpuPixelPrioBufs layerbuf;
+  /* Static: identity entries are line-generation stamped, so a reused
+   * buffer needs no clearing (an 11 KiB memset per layer and line). */
+  static PpuPixelPrioBufs layerbuf;
   ClearBackdrop(&layerbuf);
-  if (PpuIdentOn(ppu))
-    PpuIdentClear(&layerbuf);
   if (PPU_bigTiles(ppu, layer))
     PpuDrawBackgroundBig(ppu, &layerbuf, y, sub, layer, 2, zhi, zlo, mosaic);
   else if (mosaic)
@@ -2509,10 +2537,15 @@ static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
     line->brightness = PPU_brightness(ppu);
     line->composed = 1;
   }
+  /* Columns this line composed; the rest of the identity row is cleared
+   * below, so hosts never need to clear the whole capture per frame. */
+  size_t ident_lo = (size_t)-1, ident_hi = 0;
 #define IDENT_EMIT(flags_, sub_from_buffer) do { \
     const size_t ox = (size_t)(dst - dst_org); \
     if (ident_row && ox < ppu->identPitch) { \
       PpuIdentityPixel *gp = &ident_row[ox]; \
+      if (ox < ident_lo) ident_lo = ox; \
+      if (ox + 1 > ident_hi) ident_hi = ox + 1; \
       gp->main_ref = PpuIdentRef(ppu, &ppu->bgBuffers[0], i); \
       gp->main_index = (uint8_t)(pixel & 0xff); \
       gp->main_layer = (uint8_t)((pixel >> 8) & 0xf); \
@@ -2521,9 +2554,11 @@ static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
       if (sub_from_buffer) { \
         gp->sub_ref = PpuIdentRef(ppu, &ppu->bgBuffers[1], i); \
         gp->sub_index = (uint8_t)(ppu->bgBuffers[1].data[i] & 0xff); \
+        gp->sub_layer = (uint8_t)((ppu->bgBuffers[1].data[i] >> 8) & 0xf); \
       } else { \
         gp->sub_ref = 0; \
         gp->sub_index = 0; \
+        gp->sub_layer = 0; \
       } \
     } \
   } while (0)
@@ -2542,12 +2577,12 @@ static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
         uint16 pixel = ppu->bgBuffers[0].data[i];
         bool outside_world = i < hud_world_left || i >= hud_world_right;
         const uint8 main_layer = (pixel >> 8) & 0xf;
-        const bool keep_hud =
-            (hud_full_width && main_layer == 2) ||
-            (anchor_full_width && main_layer == anchor_full_layer) ||
-            (oam_hud_full_width &&
-             (main_layer == 4 || main_layer == 6));
-        if (outside_world && !keep_hud) {
+        /* The HUD exceptions only matter outside the live world span. */
+        if (outside_world &&
+            !((hud_full_width && main_layer == 2) ||
+              (anchor_full_width && main_layer == anchor_full_layer) ||
+              (oam_hud_full_width &&
+               (main_layer == 4 || main_layer == 6)))) {
           dst[0] = 0;
           IDENT_EMIT(kPpuIdentFlag_Black, false);
         } else {
@@ -2568,12 +2603,11 @@ static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
         uint16 pixel = ppu->bgBuffers[0].data[i];
         uint8 main_layer = (pixel >> 8) & 0xf;
         bool outside_world = i < hud_world_left || i >= hud_world_right;
-        const bool keep_hud =
-            (hud_full_width && main_layer == 2) ||
-            (anchor_full_width && main_layer == anchor_full_layer) ||
-            (oam_hud_full_width &&
-             (main_layer == 4 || main_layer == 6));
-        if (outside_world && !keep_hud) {
+        if (outside_world &&
+            !((hud_full_width && main_layer == 2) ||
+              (anchor_full_width && main_layer == anchor_full_layer) ||
+              (oam_hud_full_width &&
+               (main_layer == 4 || main_layer == 6)))) {
           dst[0] = 0;
           IDENT_EMIT(kPpuIdentFlag_Black, false);
         } else {
@@ -2616,6 +2650,18 @@ static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
       } while (dst++, ++i < right);
     }
   } while (cw_clip_math >>= 1, ++windex < cwin.nr);
+  if (ident_row) {
+    if (ident_lo > ident_hi)
+      ident_lo = ident_hi = 0;
+    /* Only the rendered width is ever read back; the pitch may be wider. */
+    size_t ident_end = 256 + (size_t)ppu->extraLeftRight * 2;
+    if (ident_end > ppu->identPitch)
+      ident_end = ppu->identPitch;
+    memset(ident_row, 0, ident_lo * sizeof *ident_row);
+    if (ident_hi < ident_end)
+      memset(ident_row + ident_hi, 0,
+             (ident_end - ident_hi) * sizeof *ident_row);
+  }
 #undef IDENT_EMIT
 
   PpuWriteOverlayRenderLine(ppu, kPpuOverlaySource_Obj, y);
@@ -2693,11 +2739,14 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
 
   // Range evaluation walks OAM forward, but tile fetching walks the accepted
   // sprites backward. This is observable when the 34-sliver limit is reached.
+  /* Loop invariants, read once: stores below (uint8) may alias them. */
+  const uint8_t *const sizesForObsel = spriteSizes[PPU_objSize(ppu)];
+  const bool objInterlace = PPU_objInterlace(ppu);
   for(int i = 0; i < 128; i++) {
     uint8_t y = ppu->oam[index] >> 8;
     uint8_t row = line - y;
-    int spriteSize = spriteSizes[PPU_objSize(ppu)][(ppu->highOam[index >> 3] >> ((index & 7) + 1)) & 1];
-    int spriteHeight = PPU_objInterlace(ppu) ? spriteSize / 2 : spriteSize;
+    int spriteSize = sizesForObsel[(ppu->highOam[index >> 3] >> ((index & 7) + 1)) & 1];
+    int spriteHeight = objInterlace ? spriteSize / 2 : spriteSize;
     if(row < spriteHeight) {
       int x = PpuDecodeOamX(ppu, index);
       x = PpuAdjustWidescreenHudOamX(ppu, index, y, x);
@@ -2723,7 +2772,7 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
   for(int i = spritesFound; i > 0; i--) {
     index = foundSprites[i - 1];
     uint8_t row = line - (ppu->oam[index] >> 8);
-    int spriteSize = spriteSizes[PPU_objSize(ppu)][(ppu->highOam[index >> 3] >> ((index & 7) + 1)) & 1];
+    int spriteSize = sizesForObsel[(ppu->highOam[index >> 3] >> ((index & 7) + 1)) & 1];
     int x = PpuDecodeOamX(ppu, index);
     const uint8_t sprite_y = ppu->oam[index] >> 8;
     const bool full_budget_hud =
@@ -2776,7 +2825,7 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
         int pixel = (bits >> 0) & 1 | (bits >> 7) & 2 |
                     (bits >> 14) & 4 | (bits >> 21) & 8;
         if (pixel == 0) {
-          if (ident_on) {
+          if (ident_on && !ppu->identLite) {
             /* Transparent here, drawn above whatever is already in the OBJ
              * line (lower OAM indices are processed later). */
             PpuIdentity *e =
@@ -2817,8 +2866,12 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
                 e.pad = 0;
                 /* Later OAM entries draw on top: an earlier cover here is
                  * now underneath this pixel. */
-                memset(&ppu->objBuffer.cover[oi], 0, sizeof(PpuIdentity));
-                PpuIdentPushTop(ppu, &ppu->objBuffer, oi, &e);
+                if (!ppu->identLite) {
+                  memset(&ppu->objBuffer.cover[oi], 0, sizeof(PpuIdentity));
+                  PpuIdentPushTop(ppu, &ppu->objBuffer, oi, &e);
+                } else {
+                  ppu->objBuffer.ident[oi] = e;
+                }
               }
             }
         }

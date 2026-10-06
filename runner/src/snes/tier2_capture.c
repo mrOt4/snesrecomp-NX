@@ -112,6 +112,27 @@ static void init_paths(const char *rom_title) {
         derive_journal_path(s_manifest_path);
 }
 
+int tier2_capture_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *off = getenv("SNESRECOMP_TIER2_DISABLE");
+        enabled = !(off && *off && *off != '0');
+#ifdef __SWITCH__
+        if (enabled) {
+            static const char *const kPaths[] = {
+                "SNESRECOMP_TIER2_DIR", "SNESRECOMP_TIER2_MANIFEST",
+                "SNESRECOMP_TIER2_JOURNAL"};
+            enabled = 0;
+            for (size_t i = 0; i < sizeof kPaths / sizeof kPaths[0]; i++) {
+                const char *v = getenv(kPaths[i]);
+                if (v && *v) enabled = 1;
+            }
+        }
+#endif
+    }
+    return enabled;
+}
+
 const char *tier2_capture_manifest_path(const char *rom_title) {
     init_paths(rom_title);
     return s_manifest_path;
@@ -138,6 +159,7 @@ int tier2_capture_append_discovery(const char *rom_title,
                                    const char *site_kind,
                                    int outcome,
                                    int32_t frame) {
+    if (!tier2_capture_enabled()) return 0;
     init_paths(rom_title);
     if (!s_journal) {
         s_journal = fopen(s_journal_path, "a");

@@ -1,6 +1,7 @@
 #include "common_rtl.h"
 #include "common_cpu_infra.h"
 #include <setjmp.h>
+#include <math.h>
 #include <time.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1463,8 +1464,78 @@ double RtlAudioOutputRate(void) {
   return s_render_output_rate;
 }
 
+/* Rate conversion filter, used only when the device rate differs from the
+ * native rate (e.g. Switch at 48 kHz): a 16-tap Kaiser-windowed sinc
+ * (beta 8) low-passed at 97 % of the native Nyquist rate, 256 phases with
+ * linear blending between them. Linear interpolation there leaves images
+ * and a fraction-dependent treble loss that the servo's slowly drifting
+ * ratio turns into audible roughness. The output point sits between natives
+ * 7 and 8 of the window, so every native it reads is still resident (the
+ * stream is 7 natives, 0.2 ms, later). At the native rate the original
+ * linear path below runs unchanged. */
+enum { RTL_SINC_TAPS = 16, RTL_SINC_PHASES = 256 };
+static float s_sinc_taps[RTL_SINC_PHASES + 1][RTL_SINC_TAPS];
+static int s_sinc_ready;
+
+static double rtl_bessel_i0(double x) {
+  double sum = 1.0, term = 1.0;
+  for (int k = 1; k < 32; k++) {
+    term *= (x / (2.0 * k)) * (x / (2.0 * k));
+    sum += term;
+  }
+  return sum;
+}
+
+static void rtl_build_sinc(void) {
+  const double cutoff = 0.5 * 0.97, beta = 8.0;
+  const double half = RTL_SINC_TAPS / 2.0, norm = rtl_bessel_i0(beta);
+  for (int p = 0; p <= RTL_SINC_PHASES; p++) {
+    const double frac = (double)p / RTL_SINC_PHASES;
+    double sum = 0.0;
+    for (int k = 0; k < RTL_SINC_TAPS; k++) {
+      const double x = (double)k - (half - 1.0) - frac;
+      const double arg = 2.0 * cutoff * x;
+      const double sinc = fabs(arg) < 1e-12
+          ? 1.0 : sin(3.14159265358979323846 * arg) /
+                  (3.14159265358979323846 * arg);
+      const double w = x / half;
+      const double window = fabs(w) >= 1.0
+          ? 0.0 : rtl_bessel_i0(beta * sqrt(1.0 - w * w)) / norm;
+      s_sinc_taps[p][k] = (float)(sinc * window);
+      sum += s_sinc_taps[p][k];
+    }
+    for (int k = 0; k < RTL_SINC_TAPS; k++)
+      s_sinc_taps[p][k] = (float)(s_sinc_taps[p][k] / sum);
+  }
+  s_sinc_ready = 1;
+}
+
+static void rtl_sinc_peek(const Dsp *dsp, uint32_t idx, double frac,
+                          int16 *l, int16 *r) {
+  const double scaled = frac * RTL_SINC_PHASES;
+  int phase = (int)scaled;
+  if (phase >= RTL_SINC_PHASES) phase = RTL_SINC_PHASES - 1;
+  const float t = (float)(scaled - phase);
+  const float *a = s_sinc_taps[phase], *b = s_sinc_taps[phase + 1];
+  float acc_l = 0.0f, acc_r = 0.0f;
+  for (int k = 0; k < RTL_SINC_TAPS; k++) {
+    int16_t sl, sr;
+    dsp_peek(dsp, idx + (uint32_t)k, &sl, &sr);
+    const float w = a[k] + (b[k] - a[k]) * t;
+    acc_l += w * (float)sl;
+    acc_r += w * (float)sr;
+  }
+  const long vl = lrintf(acc_l), vr = lrintf(acc_r);
+  *l = (int16)(vl > 32767 ? 32767 : vl < -32768 ? -32768 : vl);
+  *r = (int16)(vr > 32767 ? 32767 : vr < -32768 ? -32768 : vr);
+}
+
 static void rtl_render_native(Dsp *dsp, int16 *out, int frames) {
   if (frames <= 0) return;
+  const int sinc = s_render_output_rate != RTL_AUDIO_NATIVE_RATE;
+  if (sinc && !s_sinc_ready) rtl_build_sinc();
+  /* Natives the interpolation reads beyond floor(pos). */
+  const uint32_t reach = sinc ? RTL_SINC_TAPS - 1 : 1;
   uint32_t available = dsp_available(dsp);
 
   /* Servo: steer ring occupancy toward the target cushion, on top of the fixed
@@ -1484,17 +1555,17 @@ static void rtl_render_native(Dsp *dsp, int16 *out, int frames) {
    * output frame interpolates between floor(pos) and floor(pos)+1, so one
    * extra native must be present. */
   double span = s_render_phase + (double)(frames - 1) * ratio;
-  uint32_t need = (uint32_t)span + 2;
+  uint32_t need = (uint32_t)span + 1 + reach;
 
   int usable = frames;
   if (available < need) {
     /* Starving. Emit every frame we can actually source rather than blanking
      * the whole request — the old behaviour memset the full block even when
      * 533 perfectly good samples were queued. */
-    if (available < 2) {
+    if (available < 1 + reach) {
       usable = 0;
     } else {
-      double max_span = (double)(available - 2) - s_render_phase;
+      double max_span = (double)(available - 1 - reach) - s_render_phase;
       usable = max_span <= 0.0 ? 0 : (int)(max_span / ratio) + 1;
       if (usable > frames) usable = frames;
     }
@@ -1504,11 +1575,16 @@ static void rtl_render_native(Dsp *dsp, int16 *out, int frames) {
     double pos = s_render_phase + (double)i * ratio;
     uint32_t idx = (uint32_t)pos;
     double frac = pos - (double)idx;
-    int16 l0, r0, l1, r1;
-    dsp_peek(dsp, idx, &l0, &r0);
-    dsp_peek(dsp, idx + 1, &l1, &r1);
-    int16 l = (int16)((double)l0 + ((double)l1 - (double)l0) * frac);
-    int16 r = (int16)((double)r0 + ((double)r1 - (double)r0) * frac);
+    int16 l, r;
+    if (sinc) {
+      rtl_sinc_peek(dsp, idx, frac, &l, &r);
+    } else {
+      int16 l0, r0, l1, r1;
+      dsp_peek(dsp, idx, &l0, &r0);
+      dsp_peek(dsp, idx + 1, &l1, &r1);
+      l = (int16)((double)l0 + ((double)l1 - (double)l0) * frac);
+      r = (int16)((double)r0 + ((double)r1 - (double)r0) * frac);
+    }
     /* Fade in out of a starvation episode so the recovery edge is not a step.
      * The fade-out below ends at silence, so this ramps 0 -> signal.
      *

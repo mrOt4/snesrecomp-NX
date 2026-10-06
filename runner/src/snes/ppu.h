@@ -118,6 +118,7 @@ typedef struct PpuIdentityPixel {
   uint8_t cover_base;  /* CGRAM palette base of the cover tile */
   uint8_t under_layer;
   uint8_t cover_layer;
+  uint8_t sub_layer;   /* layer type nibble of the sub-screen pixel */
 } PpuIdentityPixel;
 
 typedef struct PpuIdentityLine {
@@ -367,6 +368,7 @@ struct Ppu {
   PpuIdentityLine *identLines;
   uint32_t identPitch;  /* entries per identPixels row */
   uint16_t identGen;    /* current line generation; never 0 while drawing */
+  bool identLite;       /* top pixel only, no under/cover (PpuSetIdentityShape) */
 
   // -- START OF SNAPSHOT, 0x10420 bytes
   uint16_t cgram[0x100];
@@ -550,6 +552,9 @@ bool PpuSetOverlayOamRange(Ppu *ppu, uint8_t first, uint8_t count);
 // Pass NULL to disable (the default).
 void PpuSetIdentityCapture(Ppu *ppu, PpuIdentityPixel *pixels, size_t pitch,
                            PpuIdentityLine *lines);
+// Track the under/cover pixels as well (default on). Off records only the
+// top pixel: cheaper, and under_ref/cover_ref stay 0.
+void PpuSetIdentityShape(Ppu *ppu, bool enabled);
 
 // Set the symmetric widescreen border, in pixels per side (clamped to
 // kPpuExtraLeftRight). 0 restores authentic 256-wide rendering. The internal
