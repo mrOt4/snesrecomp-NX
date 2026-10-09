@@ -23,6 +23,12 @@ typedef struct CpuState CpuState;
 
 void SimpleHdma_Init(SimpleHdma *c, DmaChannel *dc);
 void SimpleHdma_DoLine(SimpleHdma *c);
+/* SimpleHdma_DoLine without the writes: the B-bus register offsets and
+ * values it would pass to ppu_write, in order, at most `capacity` (an HDMA
+ * line writes at most 4 bytes per channel). Returns the count. A host can
+ * then replay one frame's HDMA on several Ppu copies. */
+int SimpleHdma_DoLineWrites(SimpleHdma *c, uint8 *regs, uint8 *values,
+                            int capacity);
 
 extern uint8 g_ram[0x20000];
 extern uint8 *g_sram;

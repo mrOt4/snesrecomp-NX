@@ -712,6 +712,105 @@ static inline unsigned LowestSetBit64(uint64_t value) {
  * the return-past-entry watermark exit is DISABLED, because such loops reset
  * their own stack (MMX: LDX #$02FF; TXS at $8099), which would otherwise trip
  * the is_ret watermark on the first task RTS. */
+/* Charge one interpreted opcode to the guest clock (shared by the full and
+ * the lean interpreter step). */
+static void interp_account_opcode(CpuState *cpu, int _cyc) {
+    /* Guest-time-anchored APU: advance the guest clock + SPC by this opcode's
+     * cycles, so the SPC runs continuously during interpreted code (its IPL
+     * reaches the $AABB handshake write before the CPU polls it). Mirrors the
+     * ref oracle (master = cyc*8 slowROM approx, SPC at the true ratio). Keep
+     * g_apu_last_sync_master current so a later AOT bounce's accurate-mode
+     * catch-up delta excludes what we already advanced here. */
+    if (_cyc <= 0) _cyc = 1;
+    {
+        unsigned _internal = (unsigned)_cyc > s_interp_bus_cycles
+                           ? (unsigned)_cyc - s_interp_bus_cycles : 0;
+        uint64_t _master = s_interp_bus_master + (uint64_t)_internal * 6u;
+        cpu->cycles        += (uint64_t)_cyc;
+        cpu->master_cycles += _master;
+        cpu->coprocessor_master_cycles = cpu->master_cycles;
+        if (g_snes && !RtlSpeculativeExecutionActive())
+            snes_sync_master_clock(g_snes, cpu->master_cycles);
+        if (g_snes && g_snes->cart &&
+            !RtlSpeculativeExecutionActive())
+            cart_sync_coprocessors(g_snes->cart, cpu->master_cycles);
+#ifdef SNES_COSIM
+        /* Shared APU clock (common_rtl.h): the guest-time advance is a
+         * per-side clock (master-cycle accounting differs between the
+         * interp and compiled models), so under SNES_COSIM_APU_SHARED the
+         * SPC is paced ONLY by the HW-touch estimate — identical on both
+         * sides of an A/B pair. The opcode's own port access (if any)
+         * paces via rtl_accumulate_apu_catchup like compiled code. */
+        if (!cosim_apu_shared_clock())
+#endif
+        {
+            /* Guest-time APU, batched (see bridge_apu_flush): accumulate;
+             * convert on APU-port access / ~4096 master / exits. */
+            if (!RtlSpeculativeExecutionActive() &&
+                !interp_bridge_use_absolute_apu_timeline(
+                    rtl_apu_frame_timeline_active(),
+                    g_snes && cart_has_sa1(g_snes->cart))) {
+                s_apu_pending_master += _master;
+                if (s_apu_pending_master >= 4096) bridge_apu_flush(cpu);
+            }
+        }
+    }
+}
+
+/* Lean step for the instructions of a live APU-port poll loop
+ *
+ *   loop: LDA $2140-$2143 ; EOR dp | CMP #imm ; BNE loop
+ *
+ * (the SPC upload handshakes, e.g. DKC1 $8A:B204 and $8A:B512). Every LDA
+ * bumps the continuous-read epoch, so the quiescence ring can never match
+ * inside such a loop, and the poll peeks only serve runs with a yield
+ * point. The lean step therefore runs the same opcode, bus and clock work as
+ * the full step and the same IRQ/deadline exits, skipping only that
+ * bookkeeping. Classification is cached per PC. */
+enum { kInterpLeanCache = 256 };
+static uint32_t s_interp_lean_pc[kInterpLeanCache];
+static uint8_t s_interp_lean_kind[kInterpLeanCache]; /* 1 lean, 2 not */
+
+static int interp_poll_loop_at(CpuState *cpu, uint32_t lda) {
+    if (bridge_bus_read(cpu, lda) != 0xAD) return 0;
+    const uint16_t port = (uint16_t)(bridge_bus_read(cpu, lda + 1) |
+                                     bridge_bus_read(cpu, lda + 2) << 8);
+    if (port < 0x2140 || port > 0x2143) return 0;
+    const uint8_t cmp = bridge_bus_read(cpu, lda + 3);
+    if (cmp != 0x45 && cmp != 0xC9) return 0;
+    return bridge_bus_read(cpu, lda + 5) == 0xD0 &&
+           bridge_bus_read(cpu, lda + 6) == 0xF9;
+}
+
+static int interp_lean_pc(CpuState *cpu, uint32_t pc) {
+    /* A pre-opcode hook at the PC needs the full step; the cache is valid
+     * for one hook set. */
+    static int cached_hooks = -1;
+    if (cached_hooks != s_pre_opcode_hook_count) {
+        cached_hooks = s_pre_opcode_hook_count;
+        memset(s_interp_lean_pc, 0, sizeof s_interp_lean_pc);
+    }
+    const unsigned slot = (pc ^ (pc >> 8)) & (kInterpLeanCache - 1);
+    if (s_interp_lean_pc[slot] == pc + 1)
+        return s_interp_lean_kind[slot] == 1;
+    /* pc is the LDA, the compare (LDA + 3) or the BNE (LDA + 5); the
+     * 8-bit-immediate CMP form keeps the BNE at +5 (only M=1 polls use it,
+     * see the M check in the caller). */
+    const uint16_t lo = (uint16_t)pc;
+    int lean = 0;
+    if ((lo & 0xFFFF) >= 0x8000) {
+        lean = interp_poll_loop_at(cpu, pc) ||
+               interp_poll_loop_at(cpu, pc - 3) ||
+               interp_poll_loop_at(cpu, pc - 5);
+    }
+    for (int hi = 0; lean && hi < s_pre_opcode_hook_count; hi++)
+        if (s_pre_opcode_hooks[hi].pc24 == (pc & 0x7FFFFFu))
+            lean = 0;
+    s_interp_lean_pc[slot] = pc + 1;
+    s_interp_lean_kind[slot] = lean ? 1 : 2;
+    return lean;
+}
+
 static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
                                  uint16_t s_exit, uint32_t *out_landing,
                                  uint32_t *out_return_pc,
@@ -794,8 +893,27 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
     uint64_t qbucket[64];
     uint64_t qused = 0;
     memset(qbucket, 0, sizeof qbucket);
+    /* An entry can only match a later state with the same read and write
+     * epochs, and both only grow; once either moves, every recorded entry is
+     * dead. Dropping them then (instead of scanning them on every step of a
+     * live MMIO poll, where each read bumps the read epoch) gives the same
+     * matches. */
+    uint64_t qring_read_epoch = s_interp_continuous_read_epoch;
+    uint64_t qring_write_epoch = g_interp_bridge_write_epoch;
 
     InterpHistInit();
+    /* Lean poll steps only where nothing observes the skipped bookkeeping
+     * (see interp_lean_pc). */
+    static int lean_enabled = -1;
+    if (lean_enabled < 0) {
+        const char *v = getenv("SNESRECOMP_INTERP_LEAN");
+        lean_enabled = !(v && *v == '0');
+    }
+    int lean_ok = lean_enabled && auto_quiescent && !trace && !dtrace &&
+                  !wlog_state_sync && !_ibrw && n_stop == 0 && !stop_on_rti;
+#if SNESRECOMP_REVERSE_DEBUG || defined(SNES_COSIM)
+    lean_ok = 0;
+#endif
     const long step_cap = interp_step_cap();
     long steps = 0;
     uint64_t progress_write_epoch=g_interp_bridge_write_epoch;
@@ -804,6 +922,44 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
         const uint32_t pc_before = ((uint32_t)in.k << 16) | in.pc;
         if (s_interp_hist)
             InterpHistNote(pc_before);
+        if (lean_ok && in.mf && interp_lean_pc(cpu, pc_before)) {
+            if (steps && !in.i && g_snes &&
+                (g_snes->inIrq ||
+                 (g_snes->cart && g_snes->cart->superfx &&
+                  g_snes->cart->superfx->irq_pending) ||
+                 (g_snes->cart && g_snes->cart->cx4 &&
+                  cx4_irq_pending(g_snes->cart->cx4)) ||
+                 (g_snes->cart && g_snes->cart->sa1 &&
+                  sa1_cpu_irq_pending(g_snes->cart->sa1)))) {
+                s_lle_resume_pc24=pc_before;
+                sync_interp_to_cpu(&in,cpu);
+                bridge_apu_flush(cpu);
+                return 1;
+            }
+            if (s_lle_master_deadline &&
+                cpu->master_cycles >= s_lle_master_deadline) {
+                s_lle_resume_pc24=pc_before;
+                sync_interp_to_cpu(&in,cpu);
+                bridge_apu_flush(cpu);
+                return 1;
+            }
+            s_interp_bus_master=0;
+            s_interp_bus_cycles=0;
+            s_interp_bus_timing_active=1;
+            cpu->coprocessor_master_cycles = cpu->master_cycles;
+            const int _lean_cyc = interp816_runOpcode(&in);
+            s_interp_bus_timing_active=0;
+            interp_account_opcode(cpu, _lean_cyc);
+            if (progress_write_epoch != g_interp_bridge_write_epoch ||
+                progress_dynamic_epoch != s_interp_dynamic_progress_epoch) {
+                progress_write_epoch=g_interp_bridge_write_epoch;
+                progress_dynamic_epoch=s_interp_dynamic_progress_epoch;
+                steps=0;
+            }
+            if (steps == 0 && out_landing)
+                *out_landing = ((uint32_t)in.k << 16) | in.pc;
+            continue;
+        }
 #if SNESRECOMP_REVERSE_DEBUG
         /* The reverse debugger must observe whichever execution tier owns the
          * next guest instruction. AOT blocks arrive through cpu_trace_block;
@@ -844,6 +1000,14 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
             return 1;
         }
         if (auto_quiescent) {
+            if (qring_read_epoch != s_interp_continuous_read_epoch ||
+                qring_write_epoch != g_interp_bridge_write_epoch) {
+                qring_read_epoch = s_interp_continuous_read_epoch;
+                qring_write_epoch = g_interp_bridge_write_epoch;
+                for (uint64_t live = qused; live; live &= live - 1)
+                    qbucket[QuiescentBucket(qring[LowestSetBit64(live)].pc)] = 0;
+                qused = 0;
+            }
             QuiescentState now;
             memset(&now, 0, sizeof now);
             now.pc=pc_before; now.a=in.a; now.x=in.x; now.y=in.y;
@@ -963,8 +1127,16 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
          *   LDA abs; BMI/BPL -5
          *   BIT abs; BMI/BPL -5
          * while NMI/IRQ asynchronously changes bit 15. */
-        const uint8_t _poll_op = bridge_bus_read(cpu, pc_before);
-        const uint8_t _poll_branch = bridge_bus_read(cpu, pc_before + 3);
+        /* The poll peeks below matter only to a scheduler run with a
+         * yield point; they are side-effect free for code outside the
+         * continuous-read MMIO windows, so skip them otherwise. */
+        const int _need_poll = yield_pc && !auto_quiescent;
+        const int _peek = _need_poll ||
+                          bridge_continuous_read(pc_before) ||
+                          bridge_continuous_read(pc_before + 3);
+        const uint8_t _poll_op = _peek ? bridge_bus_read(cpu, pc_before) : 0;
+        const uint8_t _poll_branch =
+            _peek ? bridge_bus_read(cpu, pc_before + 3) : 0;
         const uint16_t _poll_pc16 = (uint16_t)pc_before;
         const int _secondary_poll_pc =
             _poll_pc16 == 0xE02C || _poll_pc16 == 0xE06B ||
@@ -1203,46 +1375,7 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
                     (unsigned)sp_before, (unsigned)in.sp);
         }
 
-        /* Guest-time-anchored APU: advance the guest clock + SPC by this opcode's
-         * cycles, so the SPC runs continuously during interpreted code (its IPL
-         * reaches the $AABB handshake write before the CPU polls it). Mirrors the
-         * ref oracle (master = cyc*8 slowROM approx, SPC at the true ratio). Keep
-         * g_apu_last_sync_master current so a later AOT bounce's accurate-mode
-         * catch-up delta excludes what we already advanced here. */
-        if (_cyc <= 0) _cyc = 1;
-        {
-            unsigned _internal = (unsigned)_cyc > s_interp_bus_cycles
-                               ? (unsigned)_cyc - s_interp_bus_cycles : 0;
-            uint64_t _master = s_interp_bus_master + (uint64_t)_internal * 6u;
-            cpu->cycles        += (uint64_t)_cyc;
-            cpu->master_cycles += _master;
-            cpu->coprocessor_master_cycles = cpu->master_cycles;
-            if (g_snes && !RtlSpeculativeExecutionActive())
-                snes_sync_master_clock(g_snes, cpu->master_cycles);
-            if (g_snes && g_snes->cart &&
-                !RtlSpeculativeExecutionActive())
-                cart_sync_coprocessors(g_snes->cart, cpu->master_cycles);
-#ifdef SNES_COSIM
-            /* Shared APU clock (common_rtl.h): the guest-time advance is a
-             * per-side clock (master-cycle accounting differs between the
-             * interp and compiled models), so under SNES_COSIM_APU_SHARED the
-             * SPC is paced ONLY by the HW-touch estimate — identical on both
-             * sides of an A/B pair. The opcode's own port access (if any)
-             * paces via rtl_accumulate_apu_catchup like compiled code. */
-            if (!cosim_apu_shared_clock())
-#endif
-            {
-                /* Guest-time APU, batched (see bridge_apu_flush): accumulate;
-                 * convert on APU-port access / ~4096 master / exits. */
-                if (!RtlSpeculativeExecutionActive() &&
-                    !interp_bridge_use_absolute_apu_timeline(
-                        rtl_apu_frame_timeline_active(),
-                        g_snes && cart_has_sa1(g_snes->cart))) {
-                    s_apu_pending_master += _master;
-                    if (s_apu_pending_master >= 4096) bridge_apu_flush(cpu);
-                }
-            }
-        }
+        interp_account_opcode(cpu, _cyc);
 
         if (auto_quiescent &&
             (progress_write_epoch != g_interp_bridge_write_epoch ||

@@ -624,6 +624,13 @@ void PpuSetWsHudOamShiftRange2(Ppu *ppu, uint8_t first_slot, uint8_t nslots) {
       nslots > 128 - first_slot ? (uint8_t)(128 - first_slot) : nslots;
 }
 
+void PpuSetWsHudOamMask(Ppu *ppu, const uint8_t mask[16]) {
+  if (mask)
+    memcpy(ppu->wsHudOamMask, mask, sizeof ppu->wsHudOamMask);
+  else
+    memset(ppu->wsHudOamMask, 0, sizeof ppu->wsHudOamMask);
+}
+
 void PpuSetWidescreenBg3Widen(Ppu *ppu, uint8_t from_y) {
   ppu->wsBg3WidenY = from_y;
 }
@@ -778,6 +785,31 @@ static inline void ClearBackdrop(PpuPixelPrioBufs *buf) {
 // extra==0 (authentic) every index is already in [0,256), so this is a no-op.
 static inline uint8 PpuMosaicAt(Ppu *ppu, int i) {
   return ppu->mosaicModulo[(unsigned)i < (unsigned)kPpuXPixels ? i : (i < 0 ? 0 : kPpuXPixels - 1)];
+}
+
+/* Per-line scratch for one background layer (4bpp, 2bpp). Per thread: a
+ * host may draw scanline bands on several threads, each on its own Ppu
+ * copy. */
+static _Thread_local PpuPixelPrioBufs s_layer_scratch[2];
+
+static void PpuForgetBufs(PpuPixelPrioBufs *bufs) {
+  memset(bufs->ident, 0, sizeof bufs->ident);
+  memset(bufs->under, 0, sizeof bufs->under);
+  memset(bufs->cover, 0, sizeof bufs->cover);
+}
+
+void PpuIdentityForgetThread(void) {
+  PpuForgetBufs(&s_layer_scratch[0]);
+  PpuForgetBufs(&s_layer_scratch[1]);
+}
+
+void PpuIdentityForget(Ppu *ppu) {
+  for (int i = 0; i < 2; i++)
+    PpuForgetBufs(&ppu->bgBuffers[i]);
+  PpuForgetBufs(&ppu->objBuffer);
+  for (int i = 0; i < kPpuOverlaySource_Count; i++)
+    PpuForgetBufs(&ppu->overlayBuffers[i]);
+  PpuIdentityForgetThread();
 }
 
 void ppu_runLine(Ppu* ppu, int line) {
@@ -1984,9 +2016,10 @@ static void PpuDrawBackground_4bpp_policy(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
     return;
   }
 
-  /* Static: identity entries are line-generation stamped, so a reused
-   * buffer needs no clearing (an 11 KiB memset per layer and line). */
-  static PpuPixelPrioBufs layerbuf;
+  /* Identity entries are line-generation stamped, so a reused buffer needs
+   * no clearing (an 11 KiB memset per layer and line). */
+  PpuPixelPrioBufs *const layerbufp = &s_layer_scratch[0];
+#define layerbuf (*layerbufp)
   ClearBackdrop(&layerbuf);
   if (PPU_bigTiles(ppu, layer))
     PpuDrawBackgroundBig(ppu, &layerbuf, y, sub, layer, 4, zhi, zlo, mosaic);
@@ -2031,9 +2064,7 @@ static void PpuDrawBackground_2bpp_policy(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
     return;
   }
 
-  /* Static: identity entries are line-generation stamped, so a reused
-   * buffer needs no clearing (an 11 KiB memset per layer and line). */
-  static PpuPixelPrioBufs layerbuf;
+  PpuPixelPrioBufs *const layerbufp = &s_layer_scratch[1];
   ClearBackdrop(&layerbuf);
   if (PPU_bigTiles(ppu, layer))
     PpuDrawBackgroundBig(ppu, &layerbuf, y, sub, layer, 2, zhi, zlo, mosaic);
@@ -2052,6 +2083,7 @@ static void PpuDrawBackground_2bpp_policy(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
                              repeat_band);
   }
 }
+#undef layerbuf
 
 // Draw a whole line of a 2bpp background layer into bgBuffers, with mosaic applied
 static void PpuDrawBackground_2bpp_mosaic(Ppu *ppu, PpuPixelPrioBufs *dstbuf, int y, bool sub, uint layer, PpuZbufType zhi, PpuZbufType zlo) {
@@ -2675,6 +2707,8 @@ static bool PpuWidescreenHudOamSlot(Ppu *ppu, uint8_t index, uint8_t y) {
       (y >= 224 || y < ppu->wsHudOamHeight);
   if (!hud_y)
     return false;
+  if (ppu->wsHudOamMask[slot >> 3] & (1u << (slot & 7)))
+    return true;
   if (ppu->wsHudOamSlots &&
       slot >= ppu->wsHudOamFirstSlot &&
       slot < ppu->wsHudOamFirstSlot + ppu->wsHudOamSlots)
@@ -2696,6 +2730,9 @@ static int PpuAdjustWidescreenHudOamX(Ppu *ppu, uint8_t index, uint8_t y,
       x -= left_extra;
     else if (x >= ppu->wsHudRightStart && x < 256)
       x += right_extra;
+    /* Anchored to the picture's edges: the presentation bias moves the
+     * world, not the counters. */
+    return x;
   }
   return x - ppu->wsPresentationXBias;
 }
@@ -2703,7 +2740,15 @@ static int PpuAdjustWidescreenHudOamX(Ppu *ppu, uint8_t index, uint8_t y,
 static int PpuDecodeOamX(Ppu *ppu, uint8_t index) {
   int x = ppu->oam[index] & 0xff;
   x |= ((ppu->highOam[index >> 3] >> (index & 7)) & 1) << 8;
-  if (x >= 256 + ppu->extraRightCur) {
+  /* The right margin's visible X range ends at 255 + extraRightCur plus a
+   * positive presentation bias (the picture shifted right at a level's left
+   * end): positions up to there are on screen, not wrapped off the left.
+   * Without the bias term a sprite in that strip vanished, e.g. a Slippa
+   * walking right at the start of Reptile Rumble. */
+  int right_end = 256 + ppu->extraRightCur;
+  if (ppu->wsPresentationXBias > 0)
+    right_end += ppu->wsPresentationXBias;
+  if (x >= right_end) {
     x -= 512;
   } else if (x >= 256 && ppu->wsOamRightHintStrict) {
     int slot = index >> 1;

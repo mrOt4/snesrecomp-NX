@@ -113,11 +113,9 @@ typedef struct WsShadowLayer {
    * is keyed by that anchor. period 0 = no exact period found -> that
    * (row, anchor) keeps the plain map-wrap fallback. */
   const uint16_t *foldVram;
-  struct {
-    uint8_t set;
-    uint8_t natCol;
-    uint8_t period;
-  } foldRow[32];
+  /* One word per row so concurrent scanline bands read a consistent entry:
+   * 1 << 16 (set) | natCol << 8 | period. */
+  uint32_t foldRow[32];
 } WsShadowLayer;
 
 static WsShadowLayer s_layers[kLayers];
@@ -268,6 +266,8 @@ static void RecordDebugProvenance(int layer, int screenX, int screenY,
 
 static bool GetEntry(const WsShadowLayer *layer, uint32_t tx, uint32_t ty,
                      uint16_t *entry);
+/* Margin counters may be bumped by several scanline-band threads. */
+#define WS_STAT_INC(x) ((void)__atomic_fetch_add(&(x), 1, __ATOMIC_RELAXED))
 static void SetEntry(WsShadowLayer *layer, uint32_t tx, uint32_t ty,
                      uint16_t entry);
 
@@ -2189,8 +2189,10 @@ static uint16_t FoldMapEntry(const WsShadowLayer *layer, int row, int col) {
  * so the renderer's mod-64 column wrap preserves congruence. */
 static uint8_t FoldRowPeriod(WsShadowLayer *layer, int row, int natCol) {
   static const uint8_t kPeriods[] = {4, 8, 16};
-  if (layer->foldRow[row].set && layer->foldRow[row].natCol == natCol)
-    return layer->foldRow[row].period;
+  const uint32_t cached =
+      __atomic_load_n(&layer->foldRow[row], __ATOMIC_RELAXED);
+  if ((cached >> 16) && ((cached >> 8) & 0xff) == (uint32_t)natCol)
+    return (uint8_t)cached;
   uint8_t period = 0;
   for (size_t p = 0; p < sizeof(kPeriods) && !period; p++) {
     int ok = 1;
@@ -2200,9 +2202,9 @@ static uint8_t FoldRowPeriod(WsShadowLayer *layer, int row, int natCol) {
     if (ok)
       period = kPeriods[p];
   }
-  layer->foldRow[row].set = 1;
-  layer->foldRow[row].natCol = (uint8_t)natCol;
-  layer->foldRow[row].period = period;
+  __atomic_store_n(&layer->foldRow[row],
+                   1u << 16 | (uint32_t)(uint8_t)natCol << 8 | period,
+                   __ATOMIC_RELAXED);
   return period;
 }
 
@@ -2258,7 +2260,7 @@ uint16_t WsShadowTileDebug(int layerIndex, int screenX, int screenY,
     out_of_range = !LocalTile(layer, (uint32_t)worldX >> shift,
                               (uint32_t)worldY >> shift, &probe_x, &probe_y);
     if (out_of_range) {
-      s_marginStats[layerIndex].outOfRangeRead++;
+      WS_STAT_INC(s_marginStats[layerIndex].outOfRangeRead);
       CacheLog(layerIndex, layer, "oob_read",
                (int64_t)((uint32_t)worldX >> shift),
                (int64_t)((uint32_t)worldY >> shift));
@@ -2272,9 +2274,9 @@ uint16_t WsShadowTileDebug(int layerIndex, int screenX, int screenY,
      * missed". */
     WsShadowMarginStat *st = &s_marginStats[layerIndex];
     if (screenX < 0) {
-      if (hit) st->westHit++; else st->westMiss++;
+      if (hit) WS_STAT_INC(st->westHit); else WS_STAT_INC(st->westMiss);
     } else {
-      if (hit) st->eastHit++; else st->eastMiss++;
+      if (hit) WS_STAT_INC(st->eastHit); else WS_STAT_INC(st->eastMiss);
     }
     if (hit) {
       const uint32_t tx = (uint32_t)worldX >> shift;
@@ -2285,7 +2287,8 @@ uint16_t WsShadowTileDebug(int layerIndex, int screenX, int screenY,
         uint32_t ltx, lty;
         if (LocalTile(layer, tx, ty, &ltx, &lty)) {
           const uint32_t cell = lty * kWsShadowXTiles + ltx;
-          layer->served[cell >> 3] |= (uint8_t)(1u << (cell & 7));
+          __atomic_fetch_or(&layer->served[cell >> 3],
+                            (uint8_t)(1u << (cell & 7)), __ATOMIC_RELAXED);
         }
       }
       RecordDebugProvenance(
@@ -2307,9 +2310,9 @@ uint16_t WsShadowTileDebug(int layerIndex, int screenX, int screenY,
         int rel = (col - natCol) & 63;
         if (rel >= 32) {
           if (screenX < 0)
-            s_marginStats[layerIndex].westFold++;
+            WS_STAT_INC(s_marginStats[layerIndex].westFold);
           else
-            s_marginStats[layerIndex].eastFold++;
+            WS_STAT_INC(s_marginStats[layerIndex].eastFold);
           RecordDebugProvenance(layerIndex, screenX, screenY, pixelSpan,
                                 out_of_range ? kWsShadowProvenanceOutOfRange
                                          : kWsShadowProvenanceFold);
@@ -2322,9 +2325,9 @@ uint16_t WsShadowTileDebug(int layerIndex, int screenX, int screenY,
 
   if (layer->blankTilePlus1) {
     if (screenX < 0)
-      s_marginStats[layerIndex].westBlank++;
+      WS_STAT_INC(s_marginStats[layerIndex].westBlank);
     else
-      s_marginStats[layerIndex].eastBlank++;
+      WS_STAT_INC(s_marginStats[layerIndex].eastBlank);
     RecordDebugProvenance(layerIndex, screenX, screenY, pixelSpan,
                           out_of_range ? kWsShadowProvenanceOutOfRange
                                        : kWsShadowProvenanceBlank);
@@ -2332,9 +2335,9 @@ uint16_t WsShadowTileDebug(int layerIndex, int screenX, int screenY,
   }
   if (layer->rawContinuation && layer->wide) {
     if (screenX < 0)
-      s_marginStats[layerIndex].westRawContinuation++;
+      WS_STAT_INC(s_marginStats[layerIndex].westRawContinuation);
     else
-      s_marginStats[layerIndex].eastRawContinuation++;
+      WS_STAT_INC(s_marginStats[layerIndex].eastRawContinuation);
     RecordDebugProvenance(layerIndex, screenX, screenY, pixelSpan,
                           out_of_range
                               ? kWsShadowProvenanceOutOfRange
@@ -2342,9 +2345,9 @@ uint16_t WsShadowTileDebug(int layerIndex, int screenX, int screenY,
     return realTile;
   }
   if (screenX < 0)
-    s_marginStats[layerIndex].westRawFallback++;
+    WS_STAT_INC(s_marginStats[layerIndex].westRawFallback);
   else
-    s_marginStats[layerIndex].eastRawFallback++;
+    WS_STAT_INC(s_marginStats[layerIndex].eastRawFallback);
   RecordDebugProvenance(layerIndex, screenX, screenY, pixelSpan,
                         out_of_range ? kWsShadowProvenanceOutOfRange
                                      : kWsShadowProvenanceRawFallback);

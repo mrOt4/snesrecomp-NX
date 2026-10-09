@@ -280,6 +280,9 @@ struct Ppu {
   // general-pool objects at OAM 16+); both ranges share the band/thresholds.
   uint8_t wsHudOamFirstSlot, wsHudOamSlots, wsHudOamHeight;
   uint8_t wsHudOamFirstSlot2, wsHudOamSlots2;
+  /* Optional per-slot anchor set (PpuSetWsHudOamMask), 1 bit per OAM slot,
+   * in addition to the two ranges. */
+  uint8_t wsHudOamMask[16];
   // Widescreen BG3 widen (see PpuSetWidescreenBg3Widen). Scanlines >= this let
   // BG3 (layer 2) extend into the side margins like BG1/BG2 instead of staying
   // clamped to the authentic 256-wide region. 0 = off (BG3 clamped everywhere,
@@ -495,6 +498,14 @@ void ppu_reset(Ppu* ppu);
 bool ppu_checkOverscan(Ppu* ppu);
 void ppu_handleVblank(Ppu* ppu);
 void ppu_runLine(Ppu* ppu, int line);
+/* Identity entries are valid only while their 16-bit line generation is
+ * the current one, so after the generation wraps (every 65535 drawn lines)
+ * an old entry could pass for a new one. A host clears every stamped buffer
+ * before drawing a frame whose generations wrap: Forget clears a Ppu's
+ * buffers and the calling thread's scratch, ForgetThread only the latter
+ * (for a thread drawing on a copy of an already cleared Ppu). */
+void PpuIdentityForget(Ppu *ppu);
+void PpuIdentityForgetThread(void);
 uint8_t ppu_read(Ppu* ppu, uint8_t adr);
 void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val);
 void ppu_saveload(Ppu *ppu, SaveLoadInfo *sli);
@@ -628,6 +639,10 @@ void PpuSetWsHudOamShiftRange(Ppu *ppu, uint8_t first_slot, uint8_t nslots);
  * For sprite HUDs whose elements live outside the game's fixed HUD OAM
  * reserve. nslots 0 disables. Publish every frame like the first range. */
 void PpuSetWsHudOamShiftRange2(Ppu *ppu, uint8_t first_slot, uint8_t nslots);
+/* Anchored slots as a set (bit s & 7 of mask[s >> 3] = OAM slot s), for HUD
+ * sprites interleaved with other objects. NULL clears it. Same band and
+ * edge thresholds as the ranges; publish every frame. */
+void PpuSetWsHudOamMask(Ppu *ppu, const uint8_t mask[16]);
 
 // Publish this frame's OAM right-margin hints (see wsOamRightHintStrict).
 // `hints` is a 128-bit set (16 bytes, bit N of byte N/8 = OAM slot N), or

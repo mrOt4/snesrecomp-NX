@@ -1825,7 +1825,8 @@ void SimpleHdma_Init(SimpleHdma *c, DmaChannel *dc) {
   c->indir_bank = dc->indBank;
 }
 
-void SimpleHdma_DoLine(SimpleHdma *c) {
+int SimpleHdma_DoLineWrites(SimpleHdma *c, uint8 *regs, uint8 *values,
+                            int capacity) {
   static const uint8 bAdrOffsets[8][4] = {
     {0, 0, 0, 0},
     {0, 1, 0, 1},
@@ -1840,23 +1841,24 @@ void SimpleHdma_DoLine(SimpleHdma *c) {
     1, 2, 2, 4, 4, 4, 2, 4
   };
 
+  int count = 0;
   if (c->table == NULL)
-    return;
+    return 0;
   bool do_transfer = false;
   if ((c->rep_count & 0x7f) == 0) {
     if (!SimpleHdma_PtrRangeValid(c->table, 1)) {
       c->table = NULL;
-      return;
+      return count;
     }
     c->rep_count = *c->table++;
     if (c->rep_count == 0) {
       c->table = NULL;
-      return;
+      return count;
     }
     if(c->mode & 0x40) {
       if (!SimpleHdma_PtrRangeValid(c->table, 2)) {
         c->table = NULL;
-        return;
+        return count;
       }
       c->indir_ptr = SimpleHdma_GetPtr(c->indir_bank << 16 | c->table[0] | c->table[1] * 256);
       c->table += 2;
@@ -1877,9 +1879,22 @@ void SimpleHdma_DoLine(SimpleHdma *c) {
         c->table++;
       /* ppu_write takes the B-bus offset ($00-$3F), not a $21xx CPU address. */
       uint8 reg = (uint8)(c->ppu_addr + bAdrOffsets[c->mode & 7][j]);
-      ppu_write(g_ppu, reg, v);
-      debug_server_on_reg_write((uint16)(0x2100u + reg), v);
+      if (count < capacity) {
+        regs[count] = reg;
+        values[count] = v;
+        count++;
+      }
     }
   }
   c->rep_count--;
+  return count;
+}
+
+void SimpleHdma_DoLine(SimpleHdma *c) {
+  uint8 regs[4], values[4];
+  const int count = SimpleHdma_DoLineWrites(c, regs, values, 4);
+  for (int i = 0; i < count; i++) {
+    ppu_write(g_ppu, regs[i], values[i]);
+    debug_server_on_reg_write((uint16)(0x2100u + regs[i]), values[i]);
+  }
 }
